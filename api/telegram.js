@@ -11,14 +11,155 @@
  *   https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://YOUR-APP.vercel.app/api/telegram
  */
 
-const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 
 const BOT_TOKEN = (process.env.BOT_TOKEN || '').trim();
 const ADMIN_CHAT_ID = String(process.env.ADMIN_CHAT_ID || '-1004436177839').trim();
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 const TG_BASE = 'https://api.telegram.org/bot' + BOT_TOKEN;
+
+/* Minimal Supabase REST client — no @supabase/supabase-js needed */
+function db() {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY env');
+  }
+  const base = SUPABASE_URL + '/rest/v1';
+  const headers = function (extra) {
+    const h = {
+      apikey: SUPABASE_SERVICE_KEY,
+      Authorization: 'Bearer ' + SUPABASE_SERVICE_KEY,
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation'
+    };
+    if (extra) Object.assign(h, extra);
+    return h;
+  };
+
+  function from(table) {
+    const st = {
+      table: table,
+      sel: '*',
+      filters: [],
+      method: 'GET',
+      body: null,
+      limit: null,
+      order: null,
+      wantSingle: false,
+      wantMaybe: false,
+      isUpsert: false,
+      onConflict: null,
+      doSelectAfter: false
+    };
+
+    function qs() {
+      const p = [];
+      if (st.method === 'GET' || st.doSelectAfter) p.push('select=' + encodeURIComponent(st.sel));
+      st.filters.forEach(function (f) { p.push(f); });
+      if (st.order) p.push('order=' + st.order);
+      if (st.limit != null) p.push('limit=' + st.limit);
+      if (st.isUpsert && st.onConflict) p.push('on_conflict=' + encodeURIComponent(st.onConflict));
+      return p.length ? ('?' + p.join('&')) : '';
+    }
+
+    function run() {
+      return (async function () {
+        let url = base + '/' + st.table + qs();
+        const extra = {};
+        if (st.wantSingle || st.wantMaybe) {
+          extra['Accept'] = 'application/vnd.pgrst.object+json';
+        }
+        if (st.isUpsert) {
+          extra['Prefer'] = 'resolution=merge-duplicates,return=representation';
+        }
+        if (st.method === 'POST' && st.doSelectAfter) {
+          extra['Prefer'] = (extra['Prefer'] || 'return=representation');
+        }
+        try {
+          const res = await fetch(url, {
+            method: st.method,
+            headers: headers(extra),
+            body: st.body != null ? JSON.stringify(st.body) : undefined
+          });
+          const text = await res.text();
+          let data = null;
+          try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
+          if (!res.ok) {
+            const msg = (data && (data.message || data.error || data.hint)) || text || res.statusText;
+            return { data: null, error: { message: String(msg), code: data && data.code, status: res.status } };
+          }
+          if (st.wantMaybe) {
+            if (Array.isArray(data)) data = data.length ? data[0] : null;
+            return { data: data, error: null };
+          }
+          if (st.wantSingle) {
+            if (Array.isArray(data)) data = data[0] || null;
+            return { data: data, error: null };
+          }
+          return { data: data, error: null };
+        } catch (e) {
+          return { data: null, error: { message: e.message || String(e) } };
+        }
+      })();
+    }
+
+    const api = {
+      select: function (cols) {
+        st.sel = cols || '*';
+        st.doSelectAfter = true;
+        return api;
+      },
+      eq: function (col, val) {
+        st.filters.push(encodeURIComponent(col) + '=eq.' + encodeURIComponent(val == null ? '' : val));
+        return api;
+      },
+      ilike: function (col, val) {
+        st.filters.push(encodeURIComponent(col) + '=ilike.' + encodeURIComponent(val == null ? '' : val));
+        return api;
+      },
+      order: function (col, opts) {
+        const dir = (opts && opts.ascending === false) ? 'desc' : 'asc';
+        st.order = encodeURIComponent(col) + '.' + dir;
+        return api;
+      },
+      limit: function (n) {
+        st.limit = n;
+        return api;
+      },
+      maybeSingle: function () {
+        st.wantMaybe = true;
+        return run();
+      },
+      single: function () {
+        st.wantSingle = true;
+        return run();
+      },
+      update: function (body) {
+        st.method = 'PATCH';
+        st.body = body;
+        return api;
+      },
+      insert: function (body) {
+        st.method = 'POST';
+        st.body = body;
+        return api;
+      },
+      upsert: function (body, opts) {
+        st.method = 'POST';
+        st.body = body;
+        st.isUpsert = true;
+        st.onConflict = opts && opts.onConflict;
+        return api;
+      },
+      then: function (resolve, reject) {
+        return run().then(resolve, reject);
+      }
+    };
+    return api;
+  }
+
+  return { from: from };
+}
 
 // Mini App URL (Menu Button + keyboard web_app)
 const MINI_APP_URL = (
@@ -31,10 +172,6 @@ const SUPPORT_USERNAME = (process.env.SUPPORT_USERNAME || '@Adimn67').trim();
 const SUPPORT_USERNAME_2 = (process.env.SUPPORT_USERNAME_2 || '@Adimn67').trim();
 const CHANNEL_USERNAME = (process.env.CHANNEL_USERNAME || '@lefantasychannel').trim();
 const CHANNEL_URL = (process.env.CHANNEL_URL || 'https://t.me/lefantasychannel').trim();
-
-function db() {
-  return createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-}
 
 async function tg(method, body) {
   body = body || {};
