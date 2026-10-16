@@ -1,3 +1,16 @@
+/**
+ * ለ Fantasy — Telegram webhook (Vercel: api/telegram.js)
+ *
+ * Vercel Environment Variables:
+ *   BOT_TOKEN              = your bot token
+ *   ADMIN_CHAT_ID          = -1004436177839
+ *   SUPABASE_URL           = https://iqbwqywwrqeeycfyuwms.supabase.co
+ *   SUPABASE_SERVICE_KEY   = service_role key (secret)
+ *
+ * Webhook:
+ *   https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://YOUR-APP.vercel.app/api/telegram
+ */
+
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 
@@ -11,7 +24,7 @@ const TG_BASE = 'https://api.telegram.org/bot' + BOT_TOKEN;
 const MINI_APP_URL = (
   process.env.MINI_APP_URL ||
   process.env.WEBAPP_URL ||
-  'https://ha-fantasy.onrender.com'
+  'https://la-fantasy-1.onrender.com'
 ).trim().replace(/\/+$/, '');
 
 const SUPPORT_USERNAME = (process.env.SUPPORT_USERNAME || '@Adimn67').trim();
@@ -871,7 +884,17 @@ module.exports = async function handler(req, res) {
   console.log('ለ Fantasy API version: 2026-10-04-v6-bot-menu');
 
   if (req.method === 'GET') {
+    // Health check for browser / Vercel — never throw
     const action = req.query && req.query.action;
+    if (!action) {
+      return res.status(200).json({
+        ok: true,
+        service: 'le-fantasy-telegram',
+        bot: BOT_TOKEN ? 'token_set' : 'token_missing',
+        supabase: (SUPABASE_URL && SUPABASE_SERVICE_KEY) ? 'env_set' : 'env_missing',
+        mini_app: MINI_APP_URL
+      });
+    }
     if (action === 'wallet') {
       try {
         const initData = req.headers.authorization || '';
