@@ -66,14 +66,16 @@ function db() {
       return (async function () {
         let url = base + '/' + st.table + qs();
         const extra = {};
-        if (st.wantSingle || st.wantMaybe) {
-          extra['Accept'] = 'application/vnd.pgrst.object+json';
-        }
+        // Never use application/vnd.pgrst.object+json — causes
+        // "Cannot coerce the result to a single JSON object" when 0/2+ rows.
         if (st.isUpsert) {
           extra['Prefer'] = 'resolution=merge-duplicates,return=representation';
-        }
-        if (st.method === 'POST' && st.doSelectAfter) {
-          extra['Prefer'] = (extra['Prefer'] || 'return=representation');
+        } else if (st.method === 'PATCH' || st.method === 'DELETE') {
+          extra['Prefer'] = 'return=minimal';
+        } else if (st.method === 'POST' && st.doSelectAfter) {
+          extra['Prefer'] = 'return=representation';
+        } else if (st.method === 'POST') {
+          extra['Prefer'] = 'return=representation';
         }
         try {
           const res = await fetch(url, {
@@ -86,6 +88,11 @@ function db() {
           try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
           if (!res.ok) {
             const msg = (data && (data.message || data.error || data.hint)) || text || res.statusText;
+            // Coerce errors: treat as empty result for maybeSingle paths
+            if (String(msg).toLowerCase().indexOf('coerce') >= 0) {
+              if (st.wantMaybe) return { data: null, error: null };
+              if (st.method === 'PATCH') return { data: null, error: null };
+            }
             return { data: null, error: { message: String(msg), code: data && data.code, status: res.status } };
           }
           if (st.wantMaybe) {
@@ -94,6 +101,9 @@ function db() {
           }
           if (st.wantSingle) {
             if (Array.isArray(data)) data = data[0] || null;
+            if (data == null) {
+              return { data: null, error: { message: 'No rows returned', code: 'PGRST116' } };
+            }
             return { data: data, error: null };
           }
           return { data: data, error: null };
@@ -395,7 +405,7 @@ async function getWallet(telegramId, userName) {
     .select('*')
     .eq('telegram_id', tid)
     .maybeSingle();
-  if (error) throw error;
+  if (error) throw new Error(error.message || String(error));
   if (wallet) return wallet;
 
   const result = await sb
@@ -410,8 +420,14 @@ async function getWallet(telegramId, userName) {
     }, { onConflict: 'telegram_id' })
     .select()
     .single();
-  if (result.error) throw result.error;
-  return result.data;
+  if (result.error) {
+    console.warn('upsert wallet', result.error);
+    const again = await sb.from('user_wallets').select('*').eq('telegram_id', tid).limit(1);
+    if (again.data && again.data[0]) return again.data[0];
+    throw new Error(result.error.message || 'Could not create wallet');
+  }
+  const row = Array.isArray(result.data) ? result.data[0] : result.data;
+  return row;
 }
 
 async function isAdmin(userId) {
@@ -721,7 +737,7 @@ async function sendDepositRequest(request) {
     '🆔 Request ID:\n' + request.id + '\n\n' +
     '⏳ STATUS: PENDING';
 
-  return tg('sendMessage', {
+  const data = await tg('sendMessage', {
     chat_id: ADMIN_CHAT_ID,
     text: text,
     reply_markup: {
@@ -731,6 +747,15 @@ async function sendDepositRequest(request) {
       ]
     }
   });
+  if (!data || !data.ok) {
+    console.error('sendDepositRequest failed', ADMIN_CHAT_ID, data);
+    return {
+      ok: false,
+      description: (data && (data.description || data.error)) ||
+        ('Telegram send failed. Add the bot to group ' + ADMIN_CHAT_ID + ' as admin.')
+    };
+  }
+  return data;
 }
 
 async function sendWithdrawalRequest(request) {
@@ -819,7 +844,10 @@ async function processRequest(requestId) {
       total_withdrawals: totalWithdrawals
     })
     .eq('telegram_id', telegramId);
-  if (walletErr) throw walletErr;
+  if (walletErr) {
+    console.error('wallet update error', walletErr);
+    throw new Error(walletErr.message || walletErr || 'Wallet update failed');
+  }
 
   const newStatus = reqType === 'withdrawal' ? 'paid' : 'approved';
   const { error: reqErr } = await sb
@@ -1164,7 +1192,7 @@ module.exports = async function handler(req, res) {
 
       if (type === 'deposit') {
         const result = await sendDepositRequest(request);
-        if (!result.ok) throw new Error('Could not send deposit request to admin group');
+        if (!result.ok) throw new Error((result && result.description) || 'Could not send deposit request to admin group. Add @Lefantasy_bot to the admin group as administrator.');
       } else {
         const result = await sendWithdrawalRequest(request);
         if (!result.ok) throw new Error('Could not send withdrawal request to admin group');
