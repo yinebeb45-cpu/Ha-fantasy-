@@ -1,11 +1,11 @@
 /**
  * ለ Fantasy — Telegram webhook (Vercel: api/telegram.js)
  *
- * Vercel Environment Variables:8815069558:AAH8c3X-wvIuxzCMxH5v__qqIvo9Lbbw-WU
- *   BOT_TOKEN              = 
+ * Vercel Environment Variables:
+ *   BOT_TOKEN              = your bot token
  *   ADMIN_CHAT_ID          = -1004436177839
  *   SUPABASE_URL           = https://iqbwqywwrqeeycfyuwms.supabase.co
- *   SUPABASE_SERVICE_KEY   = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlxYndxeXd3cnFlZXljZnl1d21zIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4OTkwNTgyMiwiZXhwIjoyMTA1NDgxODIyfQ.iRwHTscRNxZ6XndsG3VG1hILwz_B24Dz9mHIVflkehQ
+ *   SUPABASE_SERVICE_KEY   = service_role key (secret)
  *
  * Webhook:
  *   https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://YOUR-APP.vercel.app/api/telegram
