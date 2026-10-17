@@ -272,7 +272,7 @@ async function handleStart(msg) {
       '✅ EPL live now\n' +
       '🚧 UCL — Coming Soon\n\n' +
       '• Entry: *100 ETB*\n' +
-      '• Deadline: *Sat 10 Oct, 14:30 EAT*\n' +
+      '• Deadline: *Sat 25 Oct, 14:30 EAT*\n' +
       '• Max 3 players per club · 15-man squad\n\n' +
       'Tap *Open ለ Fantasy* or the *Play* button below.',
     parse_mode: 'Markdown',
@@ -319,7 +319,7 @@ async function handleBotText(msg) {
       text:
         '🏆 *This week*\n\n' +
         'Premier League — *100 ETB* entry\n' +
-        'Lock: Sat 10 Oct, 14:30 EAT\n\n' +
+        'Lock: Sat 25 Oct, 14:30 EAT\n\n' +
         'Open the app → *Contest* to join and see live rankings.',
       parse_mode: 'Markdown',
       reply_markup: {
