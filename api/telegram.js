@@ -416,8 +416,7 @@ async function getWallet(telegramId, userName) {
       balance: 0,
       total_deposits: 0,
       total_withdrawals: 0,
-      total_winnings: 0
-    }, { onConflict: 'telegram_id' })
+          }, { onConflict: 'telegram_id' })
     .select()
     .single();
   if (result.error) {
