@@ -1147,6 +1147,27 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
+    if (update.action === 'get_wallet') {
+      const initData = update.initData || req.headers.authorization || '';
+      const user = verifyTelegramInitData(initData);
+      if (!user) {
+        return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
+      }
+      const wallet = await getWallet(
+        user.id,
+        [user.first_name, user.last_name].filter(Boolean).join(' ')
+      );
+      return res.status(200).json({
+        ok: true,
+        wallet: {
+          balance: Number(wallet.balance || 0),
+          total_deposits: Number(wallet.total_deposits || 0),
+          total_withdrawals: Number(wallet.total_withdrawals || 0),
+          total_winnings: Number(wallet.total_winnings || 0)
+        }
+      });
+    }
+
     if (update.action === 'wallet_request') {
       const initData = update.initData || '';
       const user = verifyTelegramInitData(initData);
