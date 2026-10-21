@@ -4,6 +4,10 @@
  * Vercel Environment Variables:
  *   BOT_TOKEN              = your bot token
  *   ADMIN_CHAT_ID          = -1004436177839
+ *   CHANNEL_ID             = @lefantasychannel  (bot must be channel admin)
+ *   BOT_USERNAME           = Lefantasy_bot
+ *   PUBLISH_SECRET         = random string for auto-post URL
+ *   MINI_APP_URL           = https://la-fantasy-1.onrender.com
  *   SUPABASE_URL           = https://iqbwqywwrqeeycfyuwms.supabase.co
  *   SUPABASE_SERVICE_KEY   = service_role key (secret)
  *
@@ -15,6 +19,11 @@ const crypto = require('crypto');
 
 const BOT_TOKEN = (process.env.BOT_TOKEN || '').trim();
 const ADMIN_CHAT_ID = String(process.env.ADMIN_CHAT_ID || '-1004436177839').trim();
+// Public channel where ads are posted (bot must be admin)
+const CHANNEL_ID = String(process.env.CHANNEL_ID || process.env.LE_CHANNEL_ID || '@lefantasychannel').trim();
+const BOT_USERNAME = String(process.env.BOT_USERNAME || 'Lefantasy_bot').replace(/^@/, '').trim();
+// Optional secret so only you can trigger auto-publish via HTTP
+const PUBLISH_SECRET = String(process.env.PUBLISH_SECRET || '').trim();
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 const TG_BASE = 'https://api.telegram.org/bot' + BOT_TOKEN;
@@ -268,6 +277,86 @@ async function ensureMenuButton() {
   }
 }
 
+
+/* =========================================================
+   CHANNEL PUBLISH — posts with Play button → opens Le Fantasy bot
+   (Channels cannot use web_app buttons; URL opens the bot / Mini App)
+========================================================= */
+
+function playButtonKeyboard() {
+  // Opens the bot chat (user taps Play / Open app inside bot)
+  const botUrl = 'https://t.me/' + BOT_USERNAME;
+  // Deep link that can open Mini App if configured in BotFather
+  const startAppUrl = 'https://t.me/' + BOT_USERNAME + '?startapp=play';
+  return {
+    inline_keyboard: [
+      [
+        { text: '⚽ Play Le Fantasy', url: startAppUrl }
+      ],
+      [
+        { text: '📱 Open Bot', url: botUrl },
+        { text: '📢 Channel', url: 'https://t.me/lefantasychannel' }
+      ]
+    ]
+  };
+}
+
+function defaultAdCaption() {
+  return (
+    '⚽ *LE FANTASY* — Weekly EPL Fantasy\n\n' +
+    'Entry: *100 ETB*\n' +
+    'Real prizes · Live points · Fair ranking\n\n' +
+    '1. Deposit\n' +
+    '2. Build your 15-man squad\n' +
+    '3. Join the contest\n\n' +
+    'Tap *Play Le Fantasy* below 👇'
+  );
+}
+
+/**
+ * Publish a text (and optional photo URL) to the channel with Play buttons.
+ * @param {{ caption?: string, photoUrl?: string, chatId?: string }} opts
+ */
+async function publishChannelPost(opts) {
+  opts = opts || {};
+  const chatId = opts.chatId || CHANNEL_ID;
+  const caption = opts.caption || defaultAdCaption();
+  const photoUrl = opts.photoUrl || opts.photo || '';
+  const keyboard = playButtonKeyboard();
+
+  if (photoUrl) {
+    const result = await tg('sendPhoto', {
+      chat_id: chatId,
+      photo: photoUrl,
+      caption: caption,
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
+    });
+    return result;
+  }
+
+  const result = await tg('sendMessage', {
+    chat_id: chatId,
+    text: caption,
+    parse_mode: 'Markdown',
+    reply_markup: keyboard,
+    disable_web_page_preview: true
+  });
+  return result;
+}
+
+function isAdminUser(msg) {
+  if (!msg || !msg.from) return false;
+  // Allow from admin group, or private chat with known admin patterns
+  const chatId = String(msg.chat && msg.chat.id);
+  if (chatId === String(ADMIN_CHAT_ID)) return true;
+  // Optional: ADMIN_USER_IDS=123,456
+  const admins = String(process.env.ADMIN_USER_IDS || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+  if (admins.length && admins.indexOf(String(msg.from.id)) >= 0) return true;
+  return false;
+}
+
+
 async function handleStart(msg) {
   const chatId = msg.chat.id;
   const first = (msg.from && msg.from.first_name) || 'Manager';
@@ -295,6 +384,58 @@ async function handleStart(msg) {
   });
 }
 
+
+/**
+ * Admin uploads a photo from their phone → publish to channel with Play buttons.
+ * Caption on the photo is used as the post text (or default ad caption).
+ * Works in private chat with bot (if ADMIN_USER_IDS set) or in ADMIN_CHAT_ID group.
+ */
+async function handleAdminPhoto(msg) {
+  const chatId = msg.chat.id;
+  if (!isAdminUser(msg)) {
+    // Ignore photos from normal users
+    return false;
+  }
+
+  const photos = msg.photo || [];
+  // Highest resolution is last
+  const best = photos[photos.length - 1];
+  if (!best || !best.file_id) {
+    await tg('sendMessage', { chat_id: chatId, text: '❌ Could not read photo.' });
+    return true;
+  }
+
+  const caption = (msg.caption && String(msg.caption).trim()) || defaultAdCaption();
+  // Telegram allows file_id when sending to another chat (same bot)
+  const result = await tg('sendPhoto', {
+    chat_id: CHANNEL_ID,
+    photo: best.file_id,
+    caption: caption,
+    parse_mode: 'Markdown',
+    reply_markup: playButtonKeyboard()
+  });
+
+  if (result && result.ok) {
+    await tg('sendMessage', {
+      chat_id: chatId,
+      text:
+        '✅ Photo posted to channel with *Play* button.\n' +
+        'Channel: `' + CHANNEL_ID + '`',
+      parse_mode: 'Markdown'
+    });
+  } else {
+    await tg('sendMessage', {
+      chat_id: chatId,
+      text:
+        '❌ Failed to post photo.\n' +
+        'Make sure the bot is *admin* in the channel.\n' +
+        'Error: ' + JSON.stringify((result && result.description) || result || 'unknown'),
+      parse_mode: 'Markdown'
+    });
+  }
+  return true;
+}
+
 async function handleBotText(msg) {
   const chatId = msg.chat.id;
   const text = String(msg.text || '').trim();
@@ -302,6 +443,69 @@ async function handleBotText(msg) {
 
   if (lower === '/start' || lower.indexOf('/start') === 0) {
     await handleStart(msg);
+    return true;
+  }
+
+  // Admin: publish ad to channel with Play button
+  // /post  or  /post Your custom caption here
+  // /postphoto https://example.com/image.jpg Caption text
+  if (lower === '/post' || lower.indexOf('/post ') === 0 || lower.indexOf('/postphoto') === 0) {
+    if (!isAdminUser(msg)) {
+      await tg('sendMessage', { chat_id: chatId, text: '⛔ Admin only.' });
+      return true;
+    }
+    try {
+      let caption = defaultAdCaption();
+      let photoUrl = '';
+      let photoFileId = '';
+
+      // Reply to a photo on your phone: reply with /post
+      const reply = msg.reply_to_message;
+      if (reply && reply.photo && reply.photo.length) {
+        photoFileId = reply.photo[reply.photo.length - 1].file_id;
+        if (reply.caption) caption = String(reply.caption).trim();
+      }
+
+      if (lower.indexOf('/postphoto') === 0) {
+        const rest = text.replace(/^\/postphoto\s*/i, '').trim();
+        const sp = rest.indexOf(' ');
+        if (sp > 0) {
+          photoUrl = rest.slice(0, sp).trim();
+          caption = rest.slice(sp + 1).trim() || caption;
+        } else if (rest) {
+          photoUrl = rest;
+        }
+      } else if (lower.indexOf('/post ') === 0) {
+        caption = text.replace(/^\/post\s*/i, '').trim() || caption;
+      }
+
+      let result;
+      if (photoFileId) {
+        result = await tg('sendPhoto', {
+          chat_id: CHANNEL_ID,
+          photo: photoFileId,
+          caption: caption,
+          parse_mode: 'Markdown',
+          reply_markup: playButtonKeyboard()
+        });
+      } else {
+        result = await publishChannelPost({ caption: caption, photoUrl: photoUrl });
+      }
+
+      if (result && result.ok) {
+        await tg('sendMessage', {
+          chat_id: chatId,
+          text: '✅ Posted to channel with Play button.\nChannel: ' + CHANNEL_ID
+        });
+      } else {
+        await tg('sendMessage', {
+          chat_id: chatId,
+          text: '❌ Post failed: ' + JSON.stringify((result && result.description) || result || 'unknown')
+        });
+      }
+    } catch (e) {
+      await tg('sendMessage', { chat_id: chatId, text: '❌ ' + (e.message || String(e)) });
+    }
     return true;
   }
 
@@ -1059,6 +1263,25 @@ module.exports = async function handler(req, res) {
         mini_app: MINI_APP_URL
       });
     }
+    if (action === 'publish') {
+      const secret = (req.query && req.query.secret) || (req.headers['x-publish-secret']) || '';
+      if (PUBLISH_SECRET && String(secret) !== PUBLISH_SECRET) {
+        return res.status(401).json({ ok: false, error: 'Unauthorized' });
+      }
+      if (!PUBLISH_SECRET) {
+        console.warn('PUBLISH_SECRET not set — publish endpoint is open; set it in Vercel env');
+      }
+      try {
+        const caption = (req.query && req.query.caption) || (req.body && req.body.caption) || defaultAdCaption();
+        const photoUrl = (req.query && req.query.photo) || (req.body && req.body.photo) || '';
+        const result = await publishChannelPost({ caption: caption, photoUrl: photoUrl });
+        return res.status(200).json({ ok: !!(result && result.ok), result: result });
+      } catch (e) {
+        console.error('publish error', e);
+        return res.status(500).json({ ok: false, error: e.message || String(e) });
+      }
+    }
+
     if (action === 'wallet') {
       try {
         const initData = req.headers.authorization || '';
@@ -1099,12 +1322,19 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // Bot chat: /start + reply keyboard buttons (Hahu-style)
-    if (update.message && update.message.text) {
+    // Bot chat: text commands + photo publish from phone
+    if (update.message) {
       try {
-        await handleBotText(update.message);
+        // Admin sent a photo from device → post to channel with Play button
+        if (update.message.photo && update.message.photo.length) {
+          await handleAdminPhoto(update.message);
+          return res.status(200).json({ ok: true });
+        }
+        if (update.message.text) {
+          await handleBotText(update.message);
+        }
       } catch (e) {
-        console.error('handleBotText error:', e);
+        console.error('handleBot message error:', e);
       }
       return res.status(200).json({ ok: true });
     }
