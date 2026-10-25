@@ -21,11 +21,17 @@ const BOT_TOKEN = (process.env.BOT_TOKEN || '').trim();
 const ADMIN_CHAT_ID = String(process.env.ADMIN_CHAT_ID || '-1004436177839').trim();
 // Public channel where ads are posted (bot must be admin)
 const CHANNEL_ID = String(process.env.CHANNEL_ID || process.env.LE_CHANNEL_ID || '@lefantasychannel').trim();
-const BOT_USERNAME = String(process.env.BOT_USERNAME || 'Lefantasy_bot').replace(/^@/, '').trim();
+const BOT_USERNAME = String(process.env.BOT_USERNAME || 'Lefantasy1_bot').replace(/^@/, '').trim();
 // Optional secret so only you can trigger auto-publish via HTTP
 const PUBLISH_SECRET = String(process.env.PUBLISH_SECRET || '').trim();
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+
+const INFLUENCER_PROMOS = {
+  ELA11: { discount: 10, share: 7, house: 3, telegramId: process.env.INFLUENCER_ELA_ID || '' },
+  JONI11: { discount: 10, share: 7, house: 3, telegramId: process.env.INFLUENCER_JONI_ID || '' }
+};
+
 const TG_BASE = 'https://api.telegram.org/bot' + BOT_TOKEN;
 
 /* Minimal Supabase REST client — no @supabase/supabase-js needed */
@@ -284,10 +290,9 @@ async function ensureMenuButton() {
 ========================================================= */
 
 function playButtonKeyboard() {
-  // Opens the bot chat (user taps Play / Open app inside bot)
-  const botUrl = 'https://t.me/' + BOT_USERNAME;
-  // Deep link that can open Mini App if configured in BotFather
-  const startAppUrl = 'https://t.me/' + BOT_USERNAME + '?startapp=play';
+  // Always open the live bot
+  const botUrl = 'https://t.me/Lefantasy1_bot';
+  const startAppUrl = 'https://t.me/Lefantasy1_bot?startapp=play';
   return {
     inline_keyboard: [
       [
@@ -707,16 +712,20 @@ async function assertNoDuplicateReceipt(receipt, telegramId) {
   return { txn: txn };
 }
 
-async function joinLeagueServer(user, league, gameweek) {
+async function joinLeagueServer(user, league, gameweek, opts) {
   const sb = db();
   const lg = String(league || '').toUpperCase();
   if (lg !== 'EPL' && lg !== 'UCL') throw new Error('Invalid league');
   const gw = Number(gameweek) || 1;
   const tid = String(user.id);
   const userName = [user.first_name, user.last_name].filter(Boolean).join(' ') || 'Manager';
-  const ENTRY = 100;
-
-  console.log('joinLeagueServer', tid, lg, gw);
+  opts = opts || {};
+  let ENTRY = 100;
+  const rawAmt = Number(opts.amount);
+  if (!isNaN(rawAmt) && rawAmt >= 0 && rawAmt <= 100) ENTRY = Math.round(rawAmt);
+  // Promo codes: never charge more than 100; floor at 0
+  const promo = opts.promo_code ? String(opts.promo_code).toUpperCase() : '';
+  console.log('joinLeagueServer', tid, lg, gw, 'charge', ENTRY, 'promo', promo);
 
   // Prefer dedicated contest_entries table if it exists
   let useEntriesTable = true;
@@ -754,7 +763,7 @@ async function joinLeagueServer(user, league, gameweek) {
   const wallet = await getWallet(tid, userName);
   const balance = Number(wallet.balance || 0);
   if (balance < ENTRY) {
-    throw new Error('Insufficient balance. Need 100 ETB (you have ' + balance + ').');
+    throw new Error('Insufficient balance. Need ' + ENTRY + ' ETB (you have ' + balance + ').');
   }
 
   const newBalance = balance - ENTRY;
@@ -763,6 +772,42 @@ async function joinLeagueServer(user, league, gameweek) {
     .update({ balance: newBalance })
     .eq('telegram_id', tid);
   if (wErr) throw wErr;
+
+  // Influencer promo: credit 7 ETB to tiktoker wallet when code used
+  try {
+    const pcode = String((opts && opts.promo_code) || '').toUpperCase();
+    const ip = INFLUENCER_PROMOS[pcode];
+    if (ip && ip.telegramId && ENTRY < 100) {
+      const infId = String(ip.telegramId).trim();
+      if (infId) {
+        const { data: infRows } = await sb.from('user_wallets').select('*').eq('telegram_id', infId).limit(1);
+        let infBal = 0;
+        if (infRows && infRows[0]) {
+          infBal = Number(infRows[0].balance || 0) + Number(ip.share || 7);
+          await sb.from('user_wallets').update({ balance: infBal }).eq('telegram_id', infId);
+        } else {
+          await sb.from('user_wallets').insert({
+            telegram_id: infId,
+            user_name: pcode + ' influencer',
+            balance: Number(ip.share || 7),
+            total_deposits: 0,
+            total_winnings: Number(ip.share || 7)
+          });
+          infBal = Number(ip.share || 7);
+        }
+        console.log('Influencer credit', pcode, infId, '+', ip.share, 'bal', infBal);
+        try {
+          await tg('sendMessage', {
+            chat_id: infId,
+            text: '🎁 Promo *' + pcode + '* used!\n+' + (ip.share || 7) + ' ETB added to your Le Fantasy wallet.\nNew balance: ' + infBal + ' ETB',
+            parse_mode: 'Markdown'
+          });
+        } catch (e) {}
+      }
+    }
+  } catch (e) {
+    console.warn('influencer credit failed', e.message || e);
+  }
 
   async function refund() {
     await sb.from('user_wallets').update({ balance: balance }).eq('telegram_id', tid);
@@ -1464,7 +1509,7 @@ module.exports = async function handler(req, res) {
         return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
       }
       try {
-        const result = await joinLeagueServer(user, update.league, update.gameweek || 1);
+        const result = await joinLeagueServer(user, update.league, update.gameweek || 1, { amount: update.amount, promo_code: update.promo_code });
         return res.status(200).json({
           ok: true,
           already: !!result.already,
@@ -1473,7 +1518,7 @@ module.exports = async function handler(req, res) {
           charged: result.charged || 0,
           message: result.already
             ? 'Already joined this league this week.'
-            : 'Joined ' + result.league + '. 100 ETB deducted.'
+            : 'Joined ' + result.league + '. ' + (result.charged || 0) + ' ETB deducted.'
         });
       } catch (e) {
         console.error('join_league error:', e);
