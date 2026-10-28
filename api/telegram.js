@@ -27,6 +27,114 @@ const PUBLISH_SECRET = String(process.env.PUBLISH_SECRET || '').trim();
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 
+
+const WALLET_CREDIT_PROMOS = {
+  ABUCHUFREE: { amount: 100, maxUses: 1 },
+  ANDYFREE: { amount: 100, maxUses: 1 },
+  ESTARFREE: { amount: 100, maxUses: 1 }
+};
+
+async function redeemWalletPromoCode(user, code) {
+  const sb = db();
+  const c = String(code || '').toUpperCase().trim();
+  const def = WALLET_CREDIT_PROMOS[c];
+  if (!def) throw new Error('Invalid promo code');
+
+  const tid = String(user.id);
+  const userName = [user.first_name, user.last_name].filter(Boolean).join(' ') || 'Manager';
+  const amount = Number(def.amount || 100);
+  const maxUses = Number(def.maxUses || 3);
+
+  // Ensure wallet row
+  let wallet = await getWallet(tid, userName);
+  const bal0 = Number(wallet.balance || 0);
+
+  // Track redemptions in promo_redemptions (create-friendly)
+  let useCount = 0;
+  let already = false;
+  try {
+    const { data: rows, error } = await sb
+      .from('promo_redemptions')
+      .select('id, telegram_id, code')
+      .eq('code', c);
+    if (error) {
+      console.warn('promo_redemptions select:', error.message);
+      // table may not exist — fall through with soft limits only in logs
+    } else {
+      const list = rows || [];
+      useCount = list.length;
+      already = list.some(function (r) { return String(r.telegram_id) === tid; });
+    }
+  } catch (e) {
+    console.warn('promo lookup', e.message || e);
+  }
+
+  if (already) throw new Error('You already redeemed this code');
+  if (useCount >= maxUses) throw new Error(maxUses <= 1 ? 'This code was already used by someone else' : ('This code has expired (max ' + maxUses + ' people)'));
+
+  // Also block if this user redeemed ANY wallet-credit promo
+  try {
+    const { data: mine } = await sb
+      .from('promo_redemptions')
+      .select('id')
+      .eq('telegram_id', tid)
+      .in('code', Object.keys(WALLET_CREDIT_PROMOS))
+      .limit(1);
+    if (mine && mine.length) throw new Error('You already used a free wallet promo');
+  } catch (e) {
+    if (/already used a free/i.test(e.message || '')) throw e;
+  }
+
+  // Insert redemption first (unique code+telegram_id)
+  try {
+    const { error: insErr } = await sb.from('promo_redemptions').insert({
+      code: c,
+      telegram_id: tid,
+      user_name: userName,
+      amount: amount
+    });
+    if (insErr) {
+      if (/duplicate|unique/i.test(insErr.message || '')) {
+        throw new Error('You already redeemed this code');
+      }
+      // If table missing, still credit once per server-less best effort
+      console.warn('promo insert:', insErr.message);
+      if (/does not exist|schema cache/i.test(insErr.message || '')) {
+        console.warn('Run SQL to create promo_redemptions table for hard 3-person limit');
+      } else {
+        throw new Error(insErr.message || 'Redeem failed');
+      }
+    }
+  } catch (e) {
+    if (/already redeemed|already used/i.test(e.message || '')) throw e;
+    if (!/does not exist|schema cache/i.test(e.message || '')) {
+      // rethrow unknown
+      if (/Redeem failed|duplicate/i.test(e.message || '')) throw e;
+    }
+  }
+
+  const newBal = bal0 + amount;
+  const { error: wErr } = await sb
+    .from('user_wallets')
+    .update({
+      balance: newBal,
+      total_deposits: Number(wallet.total_deposits || 0) + amount
+    })
+    .eq('telegram_id', tid);
+  if (wErr) throw wErr;
+
+  try {
+    await tg('sendMessage', {
+      chat_id: tid,
+      text: '🎁 Promo *' + c + '* redeemed!\n+' + amount + ' ETB added to your wallet.\nBalance: ' + newBal + ' ETB',
+      parse_mode: 'Markdown'
+    });
+  } catch (e) {}
+
+  return { balance: newBal, amount: amount, code: c };
+}
+
+
 const INFLUENCER_PROMOS = {
   ELA11: { discount: 10, share: 7, house: 3, telegramId: process.env.INFLUENCER_ELA_ID || '' },
   JONI11: { discount: 10, share: 7, house: 3, telegramId: process.env.INFLUENCER_JONI_ID || '' }
@@ -1500,6 +1608,27 @@ module.exports = async function handler(req, res) {
           ? 'Deposit request sent for approval.'
           : 'Withdrawal request sent for processing.'
       });
+    }
+
+    if (update.action === 'redeem_promo') {
+      const initData = update.initData || '';
+      const user = verifyTelegramInitData(initData);
+      if (!user) {
+        return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
+      }
+      try {
+        const result = await redeemWalletPromoCode(user, update.code);
+        return res.status(200).json({
+          ok: true,
+          balance: result.balance,
+          amount: result.amount,
+          code: result.code,
+          message: '+' + result.amount + ' ETB credited'
+        });
+      } catch (e) {
+        console.error('redeem_promo:', e);
+        return res.status(400).json({ ok: false, error: e.message || 'Redeem failed' });
+      }
     }
 
     if (update.action === 'join_league') {
