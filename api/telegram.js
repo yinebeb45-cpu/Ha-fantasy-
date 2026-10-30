@@ -140,6 +140,36 @@ const INFLUENCER_PROMOS = {
   JONI11: { discount: 10, share: 7, house: 3, telegramId: process.env.INFLUENCER_JONI_ID || '' }
 };
 
+
+function assertDepositReceipt(receipt, amount) {
+  const text = String(receipt || '');
+  if (!text.trim()) throw new Error('Receipt required');
+  if (/COMMERCIAL BANK|CBE ACCOUNT|BANK TRANSACTION NUMBER|ACCOUNT NUMBER\s*\d{8,}/i.test(text)) {
+    throw new Error('Bank transfer receipts are not accepted. Send Telebirr to Dawit Gebremicael 251996465640.');
+  }
+  if (!/transferred\s+etb/i.test(text)) {
+    throw new Error('Invalid Telebirr SMS format');
+  }
+  if (!/to\s+dawit(\s+gebremicael)?/i.test(text) && !/to\s+gebremicael/i.test(text)) {
+    throw new Error('Receipt must show transfer TO Dawit Gebremicael (not only Dear Dawit)');
+  }
+  const fromOur = /from your telebirr account\s*251?9?996465640/i.test(text);
+  const toOur =
+    /to\s+[^\n]{0,60}(251996465640|0996465640|996465640|2519\*+[0-9]*5640)/i.test(text);
+  if (fromOur && !toOur) {
+    throw new Error('SMS shows money sent FROM our number, not a deposit TO us');
+  }
+  const m = text.match(/ETB\s*([0-9]+(?:\.[0-9]+)?)/i);
+  if (m) {
+    const smsAmt = parseFloat(m[1]);
+    if (Number.isFinite(amount) && Math.abs(smsAmt - Number(amount)) > 0.05) {
+      throw new Error('Receipt amount does not match');
+    }
+    if (smsAmt > 200) throw new Error('Max deposit 200 ETB');
+  }
+  return true;
+}
+
 const TG_BASE = 'https://api.telegram.org/bot' + BOT_TOKEN;
 
 /* Minimal Supabase REST client — no @supabase/supabase-js needed */
@@ -1568,6 +1598,11 @@ module.exports = async function handler(req, res) {
         return res.status(400).json({ ok: false, error: 'Invalid amount' });
       }
 
+      if (type === 'deposit') {
+        try { assertDepositReceipt(update.receipt || update.sms || '', amount); } catch (e) {
+          return res.status(400).json({ ok: false, error: e.message });
+        }
+      }
       if (type === 'deposit') {
         await assertNoDuplicateReceipt(update.receipt || '', user.id);
       }
