@@ -471,8 +471,7 @@ async function publishChannelPost(opts) {
     const result = await tg('sendPhoto', {
       chat_id: chatId,
       photo: photoUrl,
-      caption: caption,
-      parse_mode: 'Markdown',
+      caption: String(caption || '').slice(0, 1024),
       reply_markup: keyboard
     });
     return result;
@@ -480,8 +479,7 @@ async function publishChannelPost(opts) {
 
   const result = await tg('sendMessage', {
     chat_id: chatId,
-    text: caption,
-    parse_mode: 'Markdown',
+    text: String(caption || ''),
     reply_markup: keyboard,
     disable_web_page_preview: true
   });
@@ -549,31 +547,24 @@ async function handleAdminPhoto(msg) {
   }
 
   const caption = (msg.caption && String(msg.caption).trim()) || defaultAdCaption();
-  // Telegram allows file_id when sending to another chat (same bot)
+  // Do NOT use parse_mode on user captions — underscores/asterisks break Markdown entities
   const result = await tg('sendPhoto', {
     chat_id: CHANNEL_ID,
     photo: best.file_id,
-    caption: caption,
-    parse_mode: 'Markdown',
+    caption: String(caption).slice(0, 1024),
     reply_markup: playButtonKeyboard()
   });
 
   if (result && result.ok) {
     await tg('sendMessage', {
       chat_id: chatId,
-      text:
-        '✅ Photo posted to channel with *Play* button.\n' +
-        'Channel: `' + CHANNEL_ID + '`',
-      parse_mode: 'Markdown'
+      text: '✅ Photo posted to channel with Play button.\nChannel: ' + CHANNEL_ID
     });
   } else {
+    const errDesc = (result && result.description) ? String(result.description) : JSON.stringify(result || 'unknown');
     await tg('sendMessage', {
       chat_id: chatId,
-      text:
-        '❌ Failed to post photo.\n' +
-        'Make sure the bot is *admin* in the channel.\n' +
-        'Error: ' + JSON.stringify((result && result.description) || result || 'unknown'),
-      parse_mode: 'Markdown'
+      text: '❌ Failed to post photo.\nMake sure the bot is admin in the channel.\nError: ' + errDesc
     });
   }
   return true;
