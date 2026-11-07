@@ -531,6 +531,40 @@ async function handleStart(msg) {
  * Caption on the photo is used as the post text (or default ad caption).
  * Works in private chat with bot (if ADMIN_USER_IDS set) or in ADMIN_CHAT_ID group.
  */
+
+async function handleAdminVideo(msg) {
+  const chatId = msg.chat.id;
+  if (!isAdminUser(msg)) {
+    return false;
+  }
+  const vid = msg.video || (msg.video_note ? null : null);
+  const fileId = (msg.video && msg.video.file_id) || (msg.document && msg.document.mime_type && String(msg.document.mime_type).indexOf('video') >= 0 && msg.document.file_id);
+  if (!fileId) {
+    await tg('sendMessage', { chat_id: chatId, text: '❌ Could not read video. Send as a video (not file) if possible.' });
+    return true;
+  }
+  const caption = (msg.caption && String(msg.caption).trim()) || defaultAdCaption();
+  const result = await tg('sendVideo', {
+    chat_id: CHANNEL_ID,
+    video: fileId,
+    caption: String(caption).slice(0, 1024),
+    reply_markup: playButtonKeyboard()
+  });
+  if (result && result.ok) {
+    await tg('sendMessage', {
+      chat_id: chatId,
+      text: '✅ Video posted to channel with Play button.\nChannel: ' + CHANNEL_ID
+    });
+  } else {
+    const errDesc = (result && result.description) ? String(result.description) : JSON.stringify(result || 'unknown');
+    await tg('sendMessage', {
+      chat_id: chatId,
+      text: '❌ Failed to post video.\nMake sure the bot is admin in the channel.\nError: ' + errDesc
+    });
+  }
+  return true;
+}
+
 async function handleAdminPhoto(msg) {
   const chatId = msg.chat.id;
   if (!isAdminUser(msg)) {
@@ -1504,6 +1538,10 @@ module.exports = async function handler(req, res) {
           await handleAdminPhoto(update.message);
           return res.status(200).json({ ok: true });
         }
+        if (update.message.video || (update.message.document && update.message.document.mime_type && String(update.message.document.mime_type).indexOf('video') >= 0)) {
+          await handleAdminVideo(update.message);
+          return res.status(200).json({ ok: true });
+        }
         if (update.message.text) {
           await handleBotText(update.message);
         }
@@ -1636,7 +1674,77 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    if (update.action === 'redeem_promo') {
+    
+    if (update.action === 'settle_gw_prize') {
+      const initData = update.initData || '';
+      const user = verifyTelegramInitData(initData);
+      if (!user) {
+        return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
+      }
+      try {
+        const league = String(update.league || 'EPL').toUpperCase();
+        const gw = Number(update.gameweek || 1);
+        const prize = Math.max(0, Math.round(Number(update.prize || 0)));
+        const rank = Number(update.rank || 0);
+        const tid = String(user.id);
+        if (prize <= 0) {
+          return res.status(200).json({ ok: true, balance: null, skipped: true, message: 'No prize for this rank' });
+        }
+        const sb = db();
+        // Idempotent: prize_settlements table or unique key in wallet_requests note
+        try {
+          const { data: existing } = await sb
+            .from('prize_settlements')
+            .select('id')
+            .eq('telegram_id', tid)
+            .eq('league', league)
+            .eq('gameweek', gw)
+            .maybeSingle();
+          if (existing) {
+            const w = await getWallet(tid, [user.first_name, user.last_name].filter(Boolean).join(' ') || 'Manager');
+            return res.status(200).json({ ok: true, balance: Number(w.balance || 0), already: true });
+          }
+        } catch (e) {
+          console.warn('prize_settlements lookup', e.message || e);
+        }
+
+        const userName = [user.first_name, user.last_name].filter(Boolean).join(' ') || 'Manager';
+        let wallet = await getWallet(tid, userName);
+        const newBal = Number(wallet.balance || 0) + prize;
+        const { error: wErr } = await sb.from('user_wallets').update({
+          balance: newBal,
+          total_winnings: Number(wallet.total_winnings || 0) + prize
+        }).eq('telegram_id', tid);
+        if (wErr) throw wErr;
+
+        try {
+          await sb.from('prize_settlements').insert({
+            telegram_id: tid,
+            user_name: userName,
+            league: league,
+            gameweek: gw,
+            rank: rank,
+            amount: prize
+          });
+        } catch (e) {
+          console.warn('prize_settlements insert', e.message || e);
+        }
+
+        try {
+          await tg('sendMessage', {
+            chat_id: tid,
+            text: '🏆 GW' + gw + ' ' + league + ' prize!\nRank #' + rank + '\n+' + prize + ' ETB added to your wallet.\nBalance: ' + newBal + ' ETB'
+          });
+        } catch (e) {}
+
+        return res.status(200).json({ ok: true, balance: newBal, amount: prize, rank: rank });
+      } catch (e) {
+        console.error('settle_gw_prize', e);
+        return res.status(400).json({ ok: false, error: e.message || 'Settle failed' });
+      }
+    }
+
+if (update.action === 'redeem_promo') {
       const initData = update.initData || '';
       const user = verifyTelegramInitData(initData);
       if (!user) {
