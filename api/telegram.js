@@ -1767,7 +1767,74 @@ module.exports = async function handler(req, res) {
       }
     }
 
+    
+    if (update.action === 'revoke_settlements') {
+      // Reverse incorrect prize credits for a GW
+      try {
+        const league = String(update.league || 'EPL').toUpperCase();
+        const gw = Number(update.gameweek || 10);
+        const sb = db();
+        const { data: rows, error } = await sb.from('prize_settlements')
+          .select('*')
+          .eq('league', league)
+          .eq('gameweek', gw);
+        if (error) {
+          return res.status(500).json({ ok: false, error: error.message });
+        }
+        let reversed = 0;
+        let total = 0;
+        for (const row of (rows || [])) {
+          const tid = String(row.telegram_id);
+          const amt = Number(row.amount || 0);
+          if (!tid || amt <= 0) continue;
+          try {
+            const wallet = await getWallet(tid, row.user_name || 'Manager');
+            const newBal = Math.max(0, Number(wallet.balance || 0) - amt);
+            const newWin = Math.max(0, Number(wallet.total_winnings || 0) - amt);
+            await sb.from('user_wallets').update({
+              balance: newBal,
+              total_winnings: newWin
+            }).eq('telegram_id', tid);
+            total += amt;
+            reversed++;
+            try {
+              await tg('sendMessage', {
+                chat_id: tid,
+                text: '⚠️ Prize correction\nThe GW' + gw + ' payout of ' + amt + ' ETB was sent by mistake.\nIt has been removed from your wallet.\nNew balance: ' + newBal + ' ETB\nSorry for the confusion.'
+              });
+            } catch (e) {}
+          } catch (e) {
+            console.error('revoke one', tid, e);
+          }
+        }
+        // delete settlement records
+        try {
+          await sb.from('prize_settlements').delete().eq('league', league).eq('gameweek', gw);
+        } catch (e) {
+          console.warn('delete settlements', e.message || e);
+        }
+        return res.status(200).json({
+          ok: true,
+          league: league,
+          gameweek: gw,
+          reversed: reversed,
+          total_etb: total
+        });
+      } catch (e) {
+        console.error('revoke_settlements', e);
+        return res.status(500).json({ ok: false, error: e.message || 'revoke failed' });
+      }
+    }
+
+
     if (update.action === 'settle_gw_all') {
+      // DISABLED auto: only runs when body.confirm === true (manual admin)
+      if (update.confirm !== true && update.confirm !== 'true') {
+        return res.status(200).json({
+          ok: false,
+          error: 'Settlement disabled. Pass confirm:true only after GW fully ends.'
+        });
+      }
       // Admin or system: pay all ranks for a finished GW
       try {
         const league = String(update.league || 'EPL').toUpperCase();
@@ -1893,6 +1960,9 @@ module.exports = async function handler(req, res) {
     }
 
 if (update.action === 'settle_gw_prize') {
+      if (update.confirm !== true && update.confirm !== 'true') {
+        return res.status(200).json({ ok: false, error: 'Settlement disabled until GW fully ends. Pass confirm:true.' });
+      }
       const initData = update.initData || '';
       const user = verifyTelegramInitData(initData);
       if (!user) {
