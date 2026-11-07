@@ -1471,6 +1471,27 @@ module.exports = async function handler(req, res) {
         mini_app: MINI_APP_URL
       });
     }
+    if (action === 'fpl') {
+      // Read-only FPL proxy (replaces the missing /api/fpl): ?action=fpl&path=/bootstrap-static/
+      let fp = String((req.query && req.query.path) || '');
+      if (fp && fp[0] !== '/') fp = '/' + fp;
+      const fplOk = fp === '/bootstrap-static/' ||
+        /^\/fixtures\/(\?event=\d{1,2})?$/.test(fp) ||
+        /^\/event\/\d{1,2}\/live\/$/.test(fp);
+      if (!fplOk) return res.status(400).json({ error: 'path not allowed' });
+      try {
+        const fr = await fetch('https://fantasy.premierleague.com/api' + fp, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LeFantasy/1.0)', 'Accept': 'application/json' }
+        });
+        const ft = await fr.text();
+        if (!fr.ok) return res.status(fr.status).json({ error: 'FPL responded ' + fr.status });
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=120');
+        return res.status(200).send(ft);
+      } catch (e) {
+        return res.status(502).json({ error: (e && e.message) || 'proxy failed' });
+      }
+    }
     if (action === 'publish') {
       const secret = (req.query && req.query.secret) || (req.headers['x-publish-secret']) || '';
       if (PUBLISH_SECRET && String(secret) !== PUBLISH_SECRET) {
@@ -1700,6 +1721,8 @@ module.exports = async function handler(req, res) {
           if (league === 'EPL') return lg.indexOf('UCL') < 0 && lg.indexOf('CHAMPIONS') < 0;
           return lg.indexOf('UCL') >= 0 || lg.indexOf('CHAMPIONS') >= 0 || lg === league;
         });
+        // Only this gameweek's contest (also guards the select('*') fallback above)
+        if (gw) rows = rows.filter(function (r) { return Number(r && r.gameweek || 0) === gw; });
 
         // Merge contest_entries
         try {
@@ -1709,6 +1732,7 @@ module.exports = async function handler(req, res) {
             rows.forEach(function (r) { byId[String(r.telegram_id)] = r; });
             ce.data.forEach(function (r) {
               if (!r) return;
+              if (gw && Number(r.gameweek || 0) !== gw) return;
               var lg = String(r.league || 'EPL').toUpperCase();
               if (league === 'EPL' && (lg.indexOf('UCL') >= 0 || lg.indexOf('CHAMPIONS') >= 0)) return;
               var id = String(r.telegram_id || '');
@@ -1747,9 +1771,9 @@ module.exports = async function handler(req, res) {
           return false;
         }
         var filtered = rows.filter(function (m) {
-          return m && (m.paid === true || m.paid === 't' || m.paid === 1 || m.paid === '1' || m.paid === 'true' || hasPlayers(m));
+          return m && (m.paid === true || m.paid === 't' || m.paid === 1 || m.paid === '1' || m.paid === 'true' || (!gw && hasPlayers(m)));
         });
-        if (!filtered.length) filtered = rows;
+        if (!filtered.length && !gw) filtered = rows;
 
         filtered.sort(function (a, b) {
           return Number(b.total_points || 0) - Number(a.total_points || 0);
