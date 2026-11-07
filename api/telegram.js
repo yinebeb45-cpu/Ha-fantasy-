@@ -1675,7 +1675,224 @@ module.exports = async function handler(req, res) {
     }
 
     
-    if (update.action === 'settle_gw_prize') {
+    
+    if (update.action === 'get_leaderboard') {
+      try {
+        const league = String(update.league || 'EPL').toUpperCase();
+        const gw = Number(update.gameweek || 0) || null;
+        const sb = db();
+        let q = sb.from('user_squads')
+          .select('user_name, total_points, paid, telegram_id, players, formation, captain_id, active_chip, gameweek, joined_at, created_at, league')
+          .order('total_points', { ascending: false })
+          .limit(400);
+        if (gw) q = q.eq('gameweek', gw);
+        let { data, error } = await q;
+        if (error) {
+          console.warn('get_leaderboard squads', error.message);
+          const r2 = await sb.from('user_squads').select('*').limit(400);
+          data = r2.data || [];
+          error = r2.error;
+        }
+        let rows = data || [];
+        // filter league loosely
+        rows = rows.filter(function (r) {
+          var lg = String((r && r.league) || league).toUpperCase();
+          if (league === 'EPL') return lg.indexOf('UCL') < 0 && lg.indexOf('CHAMPIONS') < 0;
+          return lg.indexOf('UCL') >= 0 || lg.indexOf('CHAMPIONS') >= 0 || lg === league;
+        });
+
+        // Merge contest_entries
+        try {
+          const ce = await sb.from('contest_entries').select('*').limit(500);
+          if (ce.data) {
+            const byId = {};
+            rows.forEach(function (r) { byId[String(r.telegram_id)] = r; });
+            ce.data.forEach(function (r) {
+              if (!r) return;
+              var lg = String(r.league || 'EPL').toUpperCase();
+              if (league === 'EPL' && (lg.indexOf('UCL') >= 0 || lg.indexOf('CHAMPIONS') >= 0)) return;
+              var id = String(r.telegram_id || '');
+              if (!id) return;
+              var paid = r.paid === true || r.paid === 't' || r.paid === 1 || r.paid === '1' || r.paid === 'true' || r.has_squad === true;
+              if (!paid) return;
+              if (!byId[id]) {
+                byId[id] = {
+                  telegram_id: id,
+                  user_name: r.user_name || ('Manager ' + id.slice(-4)),
+                  total_points: Number(r.total_points || 0),
+                  paid: true,
+                  players: r.players,
+                  gameweek: r.gameweek,
+                  created_at: r.created_at,
+                  league: league
+                };
+              } else {
+                byId[id].paid = true;
+                if (!byId[id].user_name && r.user_name) byId[id].user_name = r.user_name;
+              }
+            });
+            rows = Object.keys(byId).map(function (k) { return byId[k]; });
+          }
+        } catch (e) { console.warn('ce merge', e.message || e); }
+
+        // Prefer paid or has players
+        function hasPlayers(m) {
+          var p = m && m.players;
+          if (!p) return false;
+          if (typeof p === 'string') {
+            try { p = JSON.parse(p); } catch (e) { return p.length > 10; }
+          }
+          if (Array.isArray(p)) return p.filter(Boolean).length >= 8;
+          if (typeof p === 'object') return Object.keys(p).length >= 8;
+          return false;
+        }
+        var filtered = rows.filter(function (m) {
+          return m && (m.paid === true || m.paid === 't' || m.paid === 1 || m.paid === '1' || m.paid === 'true' || hasPlayers(m));
+        });
+        if (!filtered.length) filtered = rows;
+
+        filtered.sort(function (a, b) {
+          return Number(b.total_points || 0) - Number(a.total_points || 0);
+        });
+
+        return res.status(200).json({
+          ok: true,
+          league: league,
+          count: filtered.length,
+          managers: filtered.slice(0, 100)
+        });
+      } catch (e) {
+        console.error('get_leaderboard', e);
+        return res.status(500).json({ ok: false, error: e.message || 'leaderboard failed' });
+      }
+    }
+
+    if (update.action === 'settle_gw_all') {
+      // Admin or system: pay all ranks for a finished GW
+      try {
+        const league = String(update.league || 'EPL').toUpperCase();
+        const gw = Number(update.gameweek || 10);
+        const entry = 100;
+        const sb = db();
+
+        // Load managers (same as leaderboard)
+        let { data: rows } = await sb.from('user_squads').select('*').limit(400);
+        rows = (rows || []).filter(function (r) {
+          var lg = String((r && r.league) || league).toUpperCase();
+          if (league === 'EPL') return lg.indexOf('UCL') < 0 && lg.indexOf('CHAMPIONS') < 0;
+          return true;
+        });
+        try {
+          const ce = await sb.from('contest_entries').select('*').limit(500);
+          const byId = {};
+          rows.forEach(function (r) { byId[String(r.telegram_id)] = r; });
+          (ce.data || []).forEach(function (r) {
+            var id = String(r.telegram_id || '');
+            if (!id) return;
+            if (!byId[id]) byId[id] = { telegram_id: id, user_name: r.user_name, total_points: r.total_points || 0, paid: true };
+            else byId[id].paid = true;
+          });
+          rows = Object.keys(byId).map(function (k) { return byId[k]; });
+        } catch (e) {}
+
+        rows = rows.filter(function (m) {
+          return m && (m.paid === true || m.paid === 't' || m.paid === 1 || m.paid === '1' || m.paid === 'true');
+        });
+        rows.sort(function (a, b) { return Number(b.total_points || 0) - Number(a.total_points || 0); });
+
+        const n = rows.length;
+        const totalCollected = n * entry;
+        const playerPool = Math.round(totalCollected * 0.75);
+        // prize distribution same spirit as client: top heavy + last 2 min 100
+        const prizes = new Array(n).fill(0);
+        if (n > 0) {
+          let lastCount = n >= 12 ? 2 : (n === 11 ? 1 : 0);
+          let lastEach = lastCount ? Math.max(100, Math.round(playerPool * 0.035)) : 0;
+          let lastTotal = lastEach * lastCount;
+          let remaining = Math.max(0, playerPool - lastTotal);
+          // weights for remaining ranks
+          const topN = n - lastCount;
+          let weights = [];
+          for (let i = 0; i < topN; i++) {
+            weights.push(Math.max(1, topN - i));
+          }
+          // boost top 2
+          if (weights.length > 0) weights[0] *= 3;
+          if (weights.length > 1) weights[1] *= 2;
+          const wsum = weights.reduce(function (a, b) { return a + b; }, 0) || 1;
+          for (let i = 0; i < topN; i++) {
+            prizes[i] = Math.round(remaining * (weights[i] / wsum));
+          }
+          for (let i = 0; i < lastCount; i++) {
+            prizes[n - lastCount + i] = lastEach;
+          }
+          // fix rounding drift on rank 1
+          const sumP = prizes.reduce(function (a, b) { return a + b; }, 0);
+          if (sumP !== playerPool && prizes.length) prizes[0] += (playerPool - sumP);
+        }
+
+        let paidOut = 0;
+        let skipped = 0;
+        for (let i = 0; i < rows.length; i++) {
+          const m = rows[i];
+          const tid = String(m.telegram_id);
+          const prize = Number(prizes[i] || 0);
+          if (prize <= 0) { skipped++; continue; }
+          // already settled?
+          try {
+            const { data: ex } = await sb.from('prize_settlements')
+              .select('id')
+              .eq('telegram_id', tid)
+              .eq('league', league)
+              .eq('gameweek', gw)
+              .maybeSingle();
+            if (ex) { skipped++; continue; }
+          } catch (e) {}
+
+          const userName = m.user_name || 'Manager';
+          let wallet = await getWallet(tid, userName);
+          const newBal = Number(wallet.balance || 0) + prize;
+          await sb.from('user_wallets').update({
+            balance: newBal,
+            total_winnings: Number(wallet.total_winnings || 0) + prize
+          }).eq('telegram_id', tid);
+
+          try {
+            await sb.from('prize_settlements').insert({
+              telegram_id: tid,
+              user_name: userName,
+              league: league,
+              gameweek: gw,
+              rank: i + 1,
+              amount: prize
+            });
+          } catch (e) {}
+
+          try {
+            await tg('sendMessage', {
+              chat_id: tid,
+              text: '🏆 GW' + gw + ' finished!\nYour rank: #' + (i + 1) + '\nPrize: +' + prize + ' ETB\nNew balance: ' + newBal + ' ETB'
+            });
+          } catch (e) {}
+          paidOut++;
+        }
+
+        return res.status(200).json({
+          ok: true,
+          league: league,
+          gameweek: gw,
+          managers: n,
+          paidOut: paidOut,
+          skipped: skipped,
+          playerPool: playerPool
+        });
+      } catch (e) {
+        console.error('settle_gw_all', e);
+        return res.status(500).json({ ok: false, error: e.message || 'settle failed' });
+      }
+    }
+
+if (update.action === 'settle_gw_prize') {
       const initData = update.initData || '';
       const user = verifyTelegramInitData(initData);
       if (!user) {
