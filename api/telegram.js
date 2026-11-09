@@ -1506,6 +1506,15 @@ module.exports = async function handler(req, res) {
         if (!done.length) return res.status(200).json({ ok: true, skipped: 'no finished + data_checked gameweek yet' });
         const gw = Math.max.apply(null, done.map(function (e) { return Number(e.id); }));
 
+        if (req.query && (req.query.dry === '1' || req.query.dry === 'true')) {
+          const dr = await (async function () {
+            let o = { code: 0, body: null };
+            const f = { setHeader: function () {}, end: function () { return f; }, status: function (c) { o.code = c; return f; }, json: function (b) { o.body = b; return f; }, send: function (b) { o.body = b; return f; } };
+            await module.exports({ method: 'POST', body: { action: 'settle_gw_all', secret: settleKey, league: 'EPL', gameweek: gw }, headers: {}, query: {} }, f);
+            return o;
+          })();
+          return res.status(200).json(Object.assign({ dry_run_only: true, nothing_was_paid: true }, dr.body || { error: 'dry run failed' }));
+        }
         const sbA = db();
         const prev = await sbA.from('prize_settlements').select('telegram_id').eq('league', 'EPL').eq('gameweek', gw).limit(1);
         if (prev.error) return res.status(500).json({ ok: false, error: 'prize_settlements lookup failed' });
@@ -1927,6 +1936,35 @@ module.exports = async function handler(req, res) {
     }
 
 
+    if (update.action === 'get_gw_final') {
+      // PUBLIC, read-only: final ranking of a gameweek (same scoring as payout dry run). Pays nothing.
+      try {
+        const gwF = Number(update.gameweek);
+        if (!Number.isFinite(gwF) || gwF < 1) return res.status(400).json({ ok: false, error: 'gameweek is required' });
+        const cacheF = (global.__gwFinalCache = global.__gwFinalCache || {});
+        const hit = cacheF[gwF];
+        if (hit && Date.now() - hit.ts < 10 * 60 * 1000) return res.status(200).json(hit.body);
+        const keyF = String(process.env.SETTLE_SECRET || PUBLISH_SECRET || '').trim();
+        if (!keyF) return res.status(500).json({ ok: false, error: 'not configured' });
+        let outF = { code: 0, body: null };
+        const fF = { setHeader: function () {}, end: function () { return fF; }, status: function (c) { outF.code = c; return fF; }, json: function (b) { outF.body = b; return fF; }, send: function (b) { outF.body = b; return fF; } };
+        await module.exports({ method: 'POST', body: { action: 'settle_gw_all', secret: keyF, league: 'EPL', gameweek: gwF }, headers: {}, query: {} }, fF);
+        const dF = outF.body;
+        if (!dF || !dF.ok || !Array.isArray(dF.ranking)) return res.status(502).json({ ok: false, error: 'final ranking unavailable' });
+        const bodyF = {
+          ok: true, gameweek: gwF, final: !!(dF.summary && dF.summary.fpl_finished && dF.summary.fpl_data_checked),
+          managers: dF.ranking.map(function (r) {
+            return { rank: r.rank, telegram_id: r.telegram_id, user_name: r.user_name, total_points: r.points, chip: r.chip, prize: r.prize, paid: true };
+          })
+        };
+        if (bodyF.final) cacheF[gwF] = { ts: Date.now(), body: bodyF };
+        return res.status(200).json(bodyF);
+      } catch (e) {
+        console.error('get_gw_final', e);
+        return res.status(500).json({ ok: false, error: 'final ranking failed' });
+      }
+    }
+
     if (update.action === 'settle_gw_all') {
       // ADMIN ONLY. Without confirm:true this is a DRY RUN: pays nothing, returns the full ranking + prizes.
       if (!adminAuthorized(update, req)) {
@@ -1993,8 +2031,8 @@ module.exports = async function handler(req, res) {
         const posOf = function (p) { const x = String((p && (p.pos || p.position)) || '').toUpperCase(); return x === 'GK' ? 'GKP' : x; };
         const chipOf = function (v) {
           const c = String(v || '').toLowerCase();
-          if (c === 'tc' || c === 'triple_captain' || c === 'triple captain') return 'TC';
-          if (c === 'bb' || c === 'bench_boost' || c === 'bench boost') return 'BB';
+          if (c === 'tc' || c === '3xc' || c === 'triple_captain' || c === 'triple captain') return 'TC';
+          if (c === 'bb' || c === 'bboost' || c === 'bench_boost' || c === 'bench boost') return 'BB';
           return null;
         };
 
