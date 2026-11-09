@@ -1448,6 +1448,13 @@ async function handleCallback(query) {
   await tg('answerCallbackQuery', { callback_query_id: query.id, text: 'Unknown action.' });
 }
 
+function adminAuthorized(update, req) {
+  const key = String(process.env.SETTLE_SECRET || PUBLISH_SECRET || '').trim();
+  const given = String((update && update.secret) || (req && req.headers && req.headers['x-admin-secret']) || '').trim();
+  if (!key || !given || key.length !== given.length) return false;
+  try { return crypto.timingSafeEqual(Buffer.from(key), Buffer.from(given)); } catch (e) { return false; }
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -1470,6 +1477,95 @@ module.exports = async function handler(req, res) {
         supabase: (SUPABASE_URL && SUPABASE_SERVICE_KEY) ? 'env_set' : 'env_missing',
         mini_app: MINI_APP_URL
       });
+    }
+    if (action === 'auto_settle') {
+      // Automatic prize payout. Called by a scheduler (Vercel cron sends "Authorization: Bearer CRON_SECRET",
+      // or send x-admin-secret / ?secret=). Pays ONCE per gameweek, only when FPL says the GW is finished AND
+      // data_checked, and only if nothing was paid for that GW yet. Anything unusual is HELD and reported to the admin chat.
+      const cronKey = String(process.env.CRON_SECRET || '').trim();
+      const bearer = String((req.headers && req.headers.authorization) || '').replace(/^Bearer\s+/i, '').trim();
+      let okCron = false;
+      try { okCron = !!(cronKey && bearer && cronKey.length === bearer.length && crypto.timingSafeEqual(Buffer.from(cronKey), Buffer.from(bearer))); } catch (e) {}
+      const okAdmin = adminAuthorized({ secret: req.query && req.query.secret }, req);
+      if (!okCron && !okAdmin) return res.status(401).json({ ok: false, error: 'Unauthorized' });
+      const notifyAdmin = async function (text) { try { await tg('sendMessage', { chat_id: ADMIN_CHAT_ID, text: text }); } catch (e) {} };
+      try {
+        const settleKey = String(process.env.SETTLE_SECRET || PUBLISH_SECRET || '').trim();
+        if (!settleKey) return res.status(500).json({ ok: false, error: 'SETTLE_SECRET not set' });
+        const fromGw = Number(process.env.AUTO_SETTLE_FROM_GW || 10);
+        const br = await fetch('https://fantasy.premierleague.com/api/bootstrap-static/', {
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LeFantasy/1.0)', 'Accept': 'application/json' }
+        });
+        if (!br.ok) return res.status(502).json({ ok: false, error: 'FPL responded ' + br.status });
+        const boot = await br.json();
+        const forcedGw = Number(req.query && req.query.gameweek);
+        const done = (boot.events || []).filter(function (e) {
+          if (!e || !e.finished || !e.data_checked) return false;
+          return Number.isFinite(forcedGw) && forcedGw > 0 ? Number(e.id) === forcedGw : Number(e.id) >= fromGw;
+        });
+        if (!done.length) return res.status(200).json({ ok: true, skipped: 'no finished + data_checked gameweek yet' });
+        const gw = Math.max.apply(null, done.map(function (e) { return Number(e.id); }));
+
+        const sbA = db();
+        const prev = await sbA.from('prize_settlements').select('telegram_id').eq('league', 'EPL').eq('gameweek', gw).limit(1);
+        if (prev.error) return res.status(500).json({ ok: false, error: 'prize_settlements lookup failed' });
+        if (prev.data && prev.data.length) return res.status(200).json({ ok: true, skipped: 'GW' + gw + ' already settled' });
+
+        // Re-use the tested settle_gw_all action: dry run first, then confirm
+        const callSettle = async function (body) {
+          let out = { code: 0, body: null };
+          const fres = {
+            setHeader: function () {}, end: function () { return fres; },
+            status: function (c) { out.code = c; return fres; },
+            json: function (b) { out.body = b; return fres; },
+            send: function (b) { out.body = b; return fres; }
+          };
+          await module.exports({ method: 'POST', body: body, headers: {}, query: {} }, fres);
+          return out;
+        };
+        const base = { action: 'settle_gw_all', secret: settleKey, league: 'EPL', gameweek: gw };
+        const dry = await callSettle(base);
+        const sm = dry.body && dry.body.summary;
+        if (!dry.body || !dry.body.ok || !sm) {
+          await notifyAdmin('⚠️ Auto payout HELD for GW' + gw + ': dry run failed (' + ((dry.body && dry.body.error) || dry.code) + '). Run settle_gw_all manually.');
+          return res.status(200).json({ ok: false, held: true, gameweek: gw, reason: 'dry run failed' });
+        }
+        if (!sm.managers || sm.unmatched_managers > 0) {
+          await notifyAdmin('⚠️ Auto payout HELD for GW' + gw + ': ' + (sm.managers ? (sm.unmatched_managers + ' manager(s) have unmatched players') : 'no joined managers') + '. Review with a dry run, then pay manually.');
+          return res.status(200).json({ ok: false, held: true, gameweek: gw, summary: sm });
+        }
+        const paidRes = await callSettle(Object.assign({}, base, { confirm: true }));
+        const pb = paidRes.body || {};
+        await notifyAdmin(pb.ok
+          ? ('✅ Auto payout done for GW' + gw + '\nManagers: ' + sm.managers + '\nPool: ' + sm.playerPool + ' ETB\nPaid winners: ' + (pb.paidOut != null ? pb.paidOut : '?'))
+          : ('⚠️ Auto payout for GW' + gw + ' stopped: ' + (pb.error || paidRes.code) + '. Check prize_settlements and run settle_gw_all again (already-paid users are skipped).'));
+        return res.status(pb.ok ? 200 : 500).json({ ok: !!pb.ok, gameweek: gw, result: pb });
+      } catch (e) {
+        console.error('auto_settle', e);
+        await notifyAdmin('⚠️ Auto payout error: ' + (e.message || e));
+        return res.status(500).json({ ok: false, error: e.message || 'auto_settle failed' });
+      }
+    }
+    if (action === 'fpl') {
+      // Read-only FPL proxy (replaces the missing /api/fpl): ?action=fpl&path=/bootstrap-static/
+      let fp = String((req.query && req.query.path) || '');
+      if (fp && fp[0] !== '/') fp = '/' + fp;
+      const fplOk = fp === '/bootstrap-static/' ||
+        /^\/fixtures\/(\?event=\d{1,2})?$/.test(fp) ||
+        /^\/event\/\d{1,2}\/live\/$/.test(fp);
+      if (!fplOk) return res.status(400).json({ error: 'path not allowed' });
+      try {
+        const fr = await fetch('https://fantasy.premierleague.com/api' + fp, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LeFantasy/1.0)', 'Accept': 'application/json' }
+        });
+        const ft = await fr.text();
+        if (!fr.ok) return res.status(fr.status).json({ error: 'FPL responded ' + fr.status });
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=120');
+        return res.status(200).send(ft);
+      } catch (e) {
+        return res.status(502).json({ error: (e && e.message) || 'proxy failed' });
+      }
     }
     if (action === 'publish') {
       const secret = (req.query && req.query.secret) || (req.headers['x-publish-secret']) || '';
@@ -1700,6 +1796,8 @@ module.exports = async function handler(req, res) {
           if (league === 'EPL') return lg.indexOf('UCL') < 0 && lg.indexOf('CHAMPIONS') < 0;
           return lg.indexOf('UCL') >= 0 || lg.indexOf('CHAMPIONS') >= 0 || lg === league;
         });
+        // Only this gameweek's contest (also guards the select('*') fallback above)
+        if (gw) rows = rows.filter(function (r) { return Number(r && r.gameweek || 0) === gw; });
 
         // Merge contest_entries
         try {
@@ -1709,13 +1807,13 @@ module.exports = async function handler(req, res) {
             rows.forEach(function (r) { byId[String(r.telegram_id)] = r; });
             ce.data.forEach(function (r) {
               if (!r) return;
+              if (gw && Number(r.gameweek || 0) !== gw) return;
               var lg = String(r.league || 'EPL').toUpperCase();
               if (league === 'EPL' && (lg.indexOf('UCL') >= 0 || lg.indexOf('CHAMPIONS') >= 0)) return;
               var id = String(r.telegram_id || '');
               if (!id) return;
-              var paid = r.paid === true || r.paid === 't' || r.paid === 1 || r.paid === '1' || r.paid === 'true' || r.has_squad === true;
+              var paid = r.paid === true || r.paid === 't' || r.paid === 1 || r.paid === '1' || r.paid === 'true'; 
               if (!paid) return;
-              if (gw && Number(r.gameweek || 0) !== Number(gw)) return;
               if (!byId[id]) {
                 byId[id] = {
                   telegram_id: id,
@@ -1730,7 +1828,6 @@ module.exports = async function handler(req, res) {
               } else {
                 byId[id].paid = true;
                 if (!byId[id].user_name && r.user_name) byId[id].user_name = r.user_name;
-                if (r.gameweek != null) byId[id].gameweek = r.gameweek;
               }
             });
             rows = Object.keys(byId).map(function (k) { return byId[k]; });
@@ -1749,16 +1846,9 @@ module.exports = async function handler(req, res) {
           return false;
         }
         var filtered = rows.filter(function (m) {
-          return m && (m.paid === true || m.paid === 't' || m.paid === 1 || m.paid === '1' || m.paid === 'true' || hasPlayers(m));
+          return m && (m.paid === true || m.paid === 't' || m.paid === 1 || m.paid === '1' || m.paid === 'true' || (!gw && hasPlayers(m)));
         });
-        if (!filtered.length) filtered = rows;
-
-        // STRICT gameweek filter when client asks for a specific GW
-        if (gw) {
-          filtered = filtered.filter(function (m) {
-            return Number(m.gameweek || 0) === Number(gw);
-          });
-        }
+        if (!filtered.length && !gw) filtered = rows;
 
         filtered.sort(function (a, b) {
           return Number(b.total_points || 0) - Number(a.total_points || 0);
@@ -1767,7 +1857,6 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({
           ok: true,
           league: league,
-          gameweek: gw,
           count: filtered.length,
           managers: filtered.slice(0, 100)
         });
@@ -1779,7 +1868,8 @@ module.exports = async function handler(req, res) {
 
     
     if (update.action === 'revoke_settlements') {
-      // Reverse incorrect prize credits for a GW
+      // Reverse incorrect prize credits for a GW (ADMIN ONLY)
+      if (!adminAuthorized(update, req)) return res.status(401).json({ ok: false, error: 'Admin secret required' });
       try {
         const league = String(update.league || 'EPL').toUpperCase();
         const gw = Number(update.gameweek || 10);
@@ -1838,44 +1928,118 @@ module.exports = async function handler(req, res) {
 
 
     if (update.action === 'settle_gw_all') {
-      // DISABLED auto: only runs when body.confirm === true (manual admin)
-      if (update.confirm !== true && update.confirm !== 'true') {
-        return res.status(200).json({
-          ok: false,
-          error: 'Settlement disabled. Pass confirm:true only after GW fully ends.'
-        });
+      // ADMIN ONLY. Without confirm:true this is a DRY RUN: pays nothing, returns the full ranking + prizes.
+      if (!adminAuthorized(update, req)) {
+        return res.status(401).json({ ok: false, error: 'Admin secret required. Set SETTLE_SECRET in Vercel and send it as "secret".' });
       }
-      // Admin or system: pay all ranks for a finished GW
       try {
         const league = String(update.league || 'EPL').toUpperCase();
-        const gw = Number(update.gameweek || 10);
+        const gw = Number(update.gameweek);
+        if (!Number.isFinite(gw) || gw < 1) return res.status(400).json({ ok: false, error: 'gameweek is required' });
+        if (league !== 'EPL') return res.status(400).json({ ok: false, error: 'Only EPL settlement is supported' });
+        const confirm = update.confirm === true || update.confirm === 'true';
         const entry = 100;
         const sb = db();
+        const isPaid = function (v) { return v === true || v === 't' || v === 1 || v === '1' || v === 'true'; };
+        const notUcl = function (r) {
+          const lg = String((r && r.league) || 'EPL').toUpperCase();
+          return lg.indexOf('UCL') < 0 && lg.indexOf('CHAMPIONS') < 0;
+        };
 
-        // Load managers (same as leaderboard)
-        let { data: rows } = await sb.from('user_squads').select('*').limit(400);
-        rows = (rows || []).filter(function (r) {
-          var lg = String((r && r.league) || league).toUpperCase();
-          if (league === 'EPL') return lg.indexOf('UCL') < 0 && lg.indexOf('CHAMPIONS') < 0;
-          return true;
+        // 1) Managers who JOINED this gameweek (paid squad rows + paid contest entries) — nobody else
+        const sq = await sb.from('user_squads').select('*').eq('gameweek', gw).limit(2000);
+        if (sq.error) throw new Error('user_squads: ' + (sq.error.message || sq.error));
+        const byId = {};
+        (sq.data || []).forEach(function (r) {
+          if (!r || !r.telegram_id || !notUcl(r)) return;
+          byId[String(r.telegram_id)] = r;
         });
-        try {
-          const ce = await sb.from('contest_entries').select('*').limit(500);
-          const byId = {};
-          rows.forEach(function (r) { byId[String(r.telegram_id)] = r; });
-          (ce.data || []).forEach(function (r) {
-            var id = String(r.telegram_id || '');
-            if (!id) return;
-            if (!byId[id]) byId[id] = { telegram_id: id, user_name: r.user_name, total_points: r.total_points || 0, paid: true };
-            else byId[id].paid = true;
+        const ce = await sb.from('contest_entries').select('*').eq('gameweek', gw).limit(2000);
+        if (ce.error) throw new Error('contest_entries: ' + (ce.error.message || ce.error));
+        (ce.data || []).forEach(function (r) {
+          if (!r || !r.telegram_id || !notUcl(r) || !isPaid(r.paid)) return;
+          const id = String(r.telegram_id);
+          if (!byId[id]) byId[id] = { telegram_id: id, user_name: r.user_name, players: [], paid: true, created_at: r.created_at };
+          else byId[id].paid = true;
+        });
+        let rows = Object.keys(byId).map(function (k) { return byId[k]; }).filter(function (m) { return isPaid(m.paid); });
+
+        // 2) Final FPL points of this gameweek (server-side, not the stale stored totals)
+        const fplGet = async function (path) {
+          const r = await fetch('https://fantasy.premierleague.com/api' + path, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LeFantasy/1.0)', 'Accept': 'application/json' }
           });
-          rows = Object.keys(byId).map(function (k) { return byId[k]; });
-        } catch (e) {}
-
-        rows = rows.filter(function (m) {
-          return m && (m.paid === true || m.paid === 't' || m.paid === 1 || m.paid === '1' || m.paid === 'true');
+          if (!r.ok) throw new Error('FPL ' + path + ' responded ' + r.status);
+          return r.json();
+        };
+        const boot = await fplGet('/bootstrap-static/');
+        const ev = (boot.events || []).find(function (e) { return Number(e.id) === gw; });
+        if (!ev) throw new Error('GW' + gw + ' not found in FPL data');
+        const live = await fplGet('/event/' + gw + '/live/');
+        const livePts = {};
+        (live.elements || []).forEach(function (row) {
+          livePts[Number(row.id)] = Number((row.stats && row.stats.total_points) != null ? row.stats.total_points : 0);
         });
-        rows.sort(function (a, b) { return Number(b.total_points || 0) - Number(a.total_points || 0); });
+        const elementIds = {};
+        (boot.elements || []).forEach(function (el) { elementIds[Number(el.id)] = true; });
+        const plRes = await sb.from('players').select('id, fpl_id').limit(5000);
+        const fplIdOf = {};
+        ((plRes && plRes.data) || []).forEach(function (p) { if (p.fpl_id != null) fplIdOf[String(p.id)] = Number(p.fpl_id); });
+
+        const FORMS = {
+          '4-3-3': { def: 4, mid: 3, fwd: 3 }, '3-4-3': { def: 3, mid: 4, fwd: 3 }, '3-5-2': { def: 3, mid: 5, fwd: 2 },
+          '4-4-2': { def: 4, mid: 4, fwd: 2 }, '4-5-1': { def: 4, mid: 5, fwd: 1 }, '5-3-2': { def: 5, mid: 3, fwd: 2 }
+        };
+        const posOf = function (p) { const x = String((p && (p.pos || p.position)) || '').toUpperCase(); return x === 'GK' ? 'GKP' : x; };
+        const chipOf = function (v) {
+          const c = String(v || '').toLowerCase();
+          if (c === 'tc' || c === 'triple_captain' || c === 'triple captain') return 'TC';
+          if (c === 'bb' || c === 'bench_boost' || c === 'bench boost') return 'BB';
+          return null;
+        };
+
+        // Same rule as the leaderboard: 1 GK + formation outfield; captain x2 (x3 Triple Captain); Bench Boost adds the bench
+        rows.forEach(function (m) {
+          let players = m.players;
+          if (typeof players === 'string') { try { players = JSON.parse(players); } catch (e) { players = []; } }
+          players = Array.isArray(players) ? players : [];
+          let unmatched = 0;
+          const ptsOf = function (p) {
+            let raw = p.fpl_id != null ? p.fpl_id : (fplIdOf[String(p.id)] != null ? fplIdOf[String(p.id)] : p.id);
+            const eid = Number(raw);
+            if (!Number.isFinite(eid) || !elementIds[eid]) { unmatched++; return 0; }
+            return livePts[eid] != null ? livePts[eid] : 0;
+          };
+          const form = FORMS[m.formation] || FORMS['4-3-3'];
+          const byPos = function (k) { return players.filter(function (p) { return posOf(p) === k; }); };
+          let xi = [].concat(byPos('GKP').slice(0, 1), byPos('DEF').slice(0, form.def), byPos('MID').slice(0, form.mid), byPos('FWD').slice(0, form.fwd));
+          let bench;
+          if (xi.length === 11) bench = players.filter(function (p) { return xi.indexOf(p) < 0; });
+          else { xi = players.slice(0, 11); bench = players.slice(11); }
+          const chip = chipOf(m.active_chip);
+          const mult = chip === 'TC' ? 3 : 2;
+          let total = 0;
+          xi.forEach(function (p) {
+            let pts = ptsOf(p);
+            if (m.captain_id != null && String(p.id) === String(m.captain_id)) pts = pts * mult;
+            total += pts;
+          });
+          if (chip === 'BB') bench.forEach(function (p) { total += ptsOf(p); });
+          m._final = total;
+          m._chip = chip;
+          m._unmatched = unmatched;
+          m._empty = players.length === 0;
+        });
+
+        // Ranking: points, then earlier entry, then name (same tie-break as the leaderboard)
+        rows.sort(function (a, b) {
+          if (b._final !== a._final) return b._final - a._final;
+          const ta = Date.parse(a.joined_at || a.created_at || 0) || 0;
+          const tb = Date.parse(b.joined_at || b.created_at || 0) || 0;
+          if (ta && tb && ta !== tb) return ta - tb;
+          const na = String(a.user_name || '').toLowerCase(), nb = String(b.user_name || '').toLowerCase();
+          return na < nb ? -1 : (na > nb ? 1 : 0);
+        });
 
         const n = rows.length;
         const totalCollected = n * entry;
@@ -1887,13 +2051,11 @@ module.exports = async function handler(req, res) {
           let lastEach = lastCount ? Math.max(100, Math.round(playerPool * 0.035)) : 0;
           let lastTotal = lastEach * lastCount;
           let remaining = Math.max(0, playerPool - lastTotal);
-          // weights for remaining ranks
           const topN = n - lastCount;
           let weights = [];
           for (let i = 0; i < topN; i++) {
             weights.push(Math.max(1, topN - i));
           }
-          // boost top 2
           if (weights.length > 0) weights[0] *= 3;
           if (weights.length > 1) weights[1] *= 2;
           const wsum = weights.reduce(function (a, b) { return a + b; }, 0) || 1;
@@ -1903,9 +2065,40 @@ module.exports = async function handler(req, res) {
           for (let i = 0; i < lastCount; i++) {
             prizes[n - lastCount + i] = lastEach;
           }
-          // fix rounding drift on rank 1
           const sumP = prizes.reduce(function (a, b) { return a + b; }, 0);
           if (sumP !== playerPool && prizes.length) prizes[0] += (playerPool - sumP);
+        }
+
+        // Already settled? (if this lookup fails we STOP rather than risk paying twice)
+        const ps = await sb.from('prize_settlements').select('telegram_id').eq('league', league).eq('gameweek', gw).limit(5000);
+        if (ps.error) throw new Error('prize_settlements lookup failed: ' + (ps.error.message || ps.error));
+        const settled = {};
+        (ps.data || []).forEach(function (r) { settled[String(r.telegram_id)] = true; });
+
+        const unmatchedManagers = rows.filter(function (m) { return m._unmatched > 0; }).length;
+        const ranking = rows.map(function (m, i) {
+          return {
+            rank: i + 1, telegram_id: String(m.telegram_id), user_name: m.user_name || 'Manager',
+            points: m._final, chip: m._chip || 'none', formation: m.formation || '4-3-3',
+            unmatched_players: m._unmatched, no_squad: m._empty, prize: prizes[i] || 0,
+            already_paid: !!settled[String(m.telegram_id)]
+          };
+        });
+        const summary = {
+          league: league, gameweek: gw, fpl_finished: !!ev.finished, fpl_data_checked: !!ev.data_checked,
+          managers: n, totalCollected: totalCollected, playerPool: playerPool,
+          unmatched_managers: unmatchedManagers, already_paid: ranking.filter(function (r) { return r.already_paid; }).length
+        };
+
+        if (!confirm) {
+          return res.status(200).json({ ok: true, dryRun: true, paid: false, summary: summary, ranking: ranking });
+        }
+
+        // ---- REAL PAYOUT: safety checks ----
+        if (!n) return res.status(409).json({ ok: false, error: 'No joined managers for this gameweek', summary: summary });
+        if (!ev.finished) return res.status(409).json({ ok: false, error: 'FPL has not marked GW' + gw + ' as finished yet', summary: summary });
+        if (unmatchedManagers > 0 && update.allowUnmatched !== true) {
+          return res.status(409).json({ ok: false, error: unmatchedManagers + ' manager(s) have players that could not be matched to FPL. Run the dry run, review, or pass allowUnmatched:true.', summary: summary });
         }
 
         let paidOut = 0;
@@ -1914,37 +2107,28 @@ module.exports = async function handler(req, res) {
           const m = rows[i];
           const tid = String(m.telegram_id);
           const prize = Number(prizes[i] || 0);
-          if (prize <= 0) { skipped++; continue; }
-          // already settled?
-          try {
-            const { data: ex } = await sb.from('prize_settlements')
-              .select('id')
-              .eq('telegram_id', tid)
-              .eq('league', league)
-              .eq('gameweek', gw)
-              .maybeSingle();
-            if (ex) { skipped++; continue; }
-          } catch (e) {}
-
+          if (prize <= 0 || settled[tid]) { skipped++; continue; }
           const userName = m.user_name || 'Manager';
-          let wallet = await getWallet(tid, userName);
-          const newBal = Number(wallet.balance || 0) + prize;
-          await sb.from('user_wallets').update({
-            balance: newBal,
-            total_winnings: Number(wallet.total_winnings || 0) + prize
-          }).eq('telegram_id', tid);
-
+          // 1) record first (prevents double pay on re-run); 2) credit wallet; if crediting fails, undo the record and stop
+          const ins = await sb.from('prize_settlements').insert({
+            telegram_id: tid, user_name: userName, league: league, gameweek: gw, rank: i + 1, amount: prize
+          });
+          if (ins && ins.error) {
+            return res.status(500).json({ ok: false, error: 'Could not record settlement for ' + tid + ': ' + (ins.error.message || ins.error), paidOut: paidOut, stoppedAtRank: i + 1 });
+          }
+          let newBal;
           try {
-            await sb.from('prize_settlements').insert({
-              telegram_id: tid,
-              user_name: userName,
-              league: league,
-              gameweek: gw,
-              rank: i + 1,
-              amount: prize
-            });
-          } catch (e) {}
-
+            const wallet = await getWallet(tid, userName);
+            newBal = Number(wallet.balance || 0) + prize;
+            const up = await sb.from('user_wallets').update({
+              balance: newBal,
+              total_winnings: Number(wallet.total_winnings || 0) + prize
+            }).eq('telegram_id', tid);
+            if (up && up.error) throw new Error(up.error.message || String(up.error));
+          } catch (e) {
+            try { await sb.from('prize_settlements').delete().eq('telegram_id', tid).eq('league', league).eq('gameweek', gw); } catch (e2) {}
+            return res.status(500).json({ ok: false, error: 'Wallet credit failed for ' + tid + ': ' + (e.message || e), paidOut: paidOut, stoppedAtRank: i + 1 });
+          }
           try {
             await tg('sendMessage', {
               chat_id: tid,
@@ -1954,15 +2138,7 @@ module.exports = async function handler(req, res) {
           paidOut++;
         }
 
-        return res.status(200).json({
-          ok: true,
-          league: league,
-          gameweek: gw,
-          managers: n,
-          paidOut: paidOut,
-          skipped: skipped,
-          playerPool: playerPool
-        });
+        return res.status(200).json({ ok: true, dryRun: false, paid: true, paidOut: paidOut, skipped: skipped, summary: summary });
       } catch (e) {
         console.error('settle_gw_all', e);
         return res.status(500).json({ ok: false, error: e.message || 'settle failed' });
@@ -1970,6 +2146,8 @@ module.exports = async function handler(req, res) {
     }
 
 if (update.action === 'settle_gw_prize') {
+      // Prize amount comes from the caller, so this is ADMIN ONLY (users must never set their own prize)
+      if (!adminAuthorized(update, req)) return res.status(401).json({ ok: false, error: 'Admin secret required' });
       if (update.confirm !== true && update.confirm !== 'true') {
         return res.status(200).json({ ok: false, error: 'Settlement disabled until GW fully ends. Pass confirm:true.' });
       }
