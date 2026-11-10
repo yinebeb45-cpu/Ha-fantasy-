@@ -217,6 +217,10 @@ function db() {
 
     function run() {
       return (async function () {
+        // Safety: never run a DELETE without at least one filter (would wipe the whole table)
+        if (st.method === 'DELETE' && !st.filters.length) {
+          return { data: null, error: { message: 'delete without filter refused' } };
+        }
         let url = base + '/' + st.table + qs();
         const extra = {};
         // Never use application/vnd.pgrst.object+json — causes
@@ -305,6 +309,11 @@ function db() {
       insert: function (body) {
         st.method = 'POST';
         st.body = body;
+        return api;
+      },
+      delete: function () {
+        st.method = 'DELETE';
+        st.body = null;
         return api;
       },
       upsert: function (body, opts) {
