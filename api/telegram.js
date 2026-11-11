@@ -18,7 +18,41 @@
 const crypto = require('crypto');
 
 const BOT_TOKEN = (process.env.BOT_TOKEN || '').trim();
-const ADMIN_CHAT_ID = String(process.env.ADMIN_CHAT_ID || '-1004436177839').trim();
+const ENV_ADMIN_CHAT_ID = String(process.env.ADMIN_CHAT_ID || '-1004436177839').trim();
+// Admin group can be switched at any time with /setadmin (saved in table bot_settings); falls back to the env value
+let ADMIN_CHAT_ID = ENV_ADMIN_CHAT_ID;
+let _adminChatLoadedAt = 0;
+async function loadAdminChatId() {
+  if (Date.now() - _adminChatLoadedAt < 30000) return ADMIN_CHAT_ID;
+  _adminChatLoadedAt = Date.now();
+  try {
+    const { data, error } = await db().from('bot_settings').select('value').eq('key', 'admin_chat_id').limit(1);
+    if (!error && data && data[0] && data[0].value) ADMIN_CHAT_ID = String(data[0].value).trim();
+    else if (!error) ADMIN_CHAT_ID = ENV_ADMIN_CHAT_ID;
+  } catch (e) { /* table missing: keep env value */ }
+  return ADMIN_CHAT_ID;
+}
+
+// Telebirr SMS (Amharic or English) -> readable Amharic receipt summary for the admin group
+function buildAmharicReceipt(request) {
+  const raw = String(request.receipt || '');
+  const amtM = raw.match(/([\d,]+(?:\.\d+)?)\s*(?:ብር|birr|etb)/i);
+  const dateM = raw.match(/(\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2}:\d{2})/);
+  const linkM = raw.match(/https?:\/\/\S+/);
+  const txn = extractTxnId(raw);
+  const paid = amtM ? Number(String(amtM[1]).replace(/,/g, '')) : null;
+  const asked = Number(request.amount);
+  let t = '🧾 የቴሌብር ደረሰኝ (Telebirr)\n\n' +
+    '👤 ተጠቃሚ: ' + (request.user_name || '—') + '\n' +
+    '💵 የተጠየቀ መጠን: ' + asked + ' ብር\n';
+  if (paid != null) t += '💰 በደረሰኙ የተላከ: ' + paid + ' ብር\n';
+  if (dateM) t += '🕒 ቀን: ' + dateM[1] + '\n';
+  if (txn) t += '🔖 የሂሳብ እንቅስቃሴ ቁጥር: ' + txn + '\n';
+  if (linkM) t += '🔗 ' + linkM[0] + '\n';
+  if (paid != null && Number.isFinite(asked) && paid !== asked) t += '\n⚠️ ማስጠንቀቂያ: በደረሰኙ ላይ ያለው መጠን ከተጠየቀው ጋር አይመሳሰልም!\n';
+  if (!txn) t += '\n⚠️ የግብይት ቁጥር አልተገኘም — ደረሰኙን በእጅ ያረጋግጡ።\n';
+  return t;
+}
 // Public channel where ads are posted (bot must be admin)
 const CHANNEL_ID = String(process.env.CHANNEL_ID || process.env.LE_CHANNEL_ID || '@lefantasychannel').trim();
 const BOT_USERNAME = String(process.env.BOT_USERNAME || 'Lefantasy1_bot').replace(/^@/, '').trim();
@@ -43,85 +77,75 @@ async function redeemWalletPromoCode(user, code) {
   const tid = String(user.id);
   const userName = [user.first_name, user.last_name].filter(Boolean).join(' ') || 'Manager';
   const amount = Number(def.amount || 100);
-  const maxUses = Number(def.maxUses || 3);
+  const maxUses = Number(def.maxUses || 1);
 
-  // Ensure wallet row
   let wallet = await getWallet(tid, userName);
   const bal0 = Number(wallet.balance || 0);
 
-  // Track redemptions in promo_redemptions (create-friendly)
-  let useCount = 0;
-  let already = false;
+  // 1) Has this code (or any free-wallet code) been used already?  (promo_redemptions = history, bot_settings = hard lock)
   try {
-    const { data: rows, error } = await sb
-      .from('promo_redemptions')
-      .select('id, telegram_id, code')
-      .eq('code', c);
-    if (error) {
-      console.warn('promo_redemptions select:', error.message);
-      // table may not exist — fall through with soft limits only in logs
-    } else {
+    const { data: rows, error } = await sb.from('promo_redemptions').select('id, telegram_id, code').eq('code', c);
+    if (!error) {
       const list = rows || [];
-      useCount = list.length;
-      already = list.some(function (r) { return String(r.telegram_id) === tid; });
+      if (list.some(function (r) { return String(r.telegram_id) === tid; })) throw new Error('You already redeemed this code');
+      if (list.length >= maxUses) throw new Error(maxUses <= 1 ? 'This code was already used by someone else' : ('This code has expired (max ' + maxUses + ' people)'));
     }
-  } catch (e) {
-    console.warn('promo lookup', e.message || e);
-  }
-
-  if (already) throw new Error('You already redeemed this code');
-  if (useCount >= maxUses) throw new Error(maxUses <= 1 ? 'This code was already used by someone else' : ('This code has expired (max ' + maxUses + ' people)'));
-
-  // Also block if this user redeemed ANY wallet-credit promo
+  } catch (e) { if (/already|expired/i.test(e.message || '')) throw e; }
   try {
-    const { data: mine } = await sb
-      .from('promo_redemptions')
-      .select('id')
-      .eq('telegram_id', tid)
-      .in('code', Object.keys(WALLET_CREDIT_PROMOS))
-      .limit(1);
-    if (mine && mine.length) throw new Error('You already used a free wallet promo');
-  } catch (e) {
-    if (/already used a free/i.test(e.message || '')) throw e;
-  }
+    const { data: mine, error } = await sb.from('promo_redemptions').select('id').eq('telegram_id', tid).in('code', Object.keys(WALLET_CREDIT_PROMOS)).limit(1);
+    if (!error && mine && mine.length) throw new Error('You already used a free wallet promo');
+  } catch (e) { if (/already used/i.test(e.message || '')) throw e; }
 
-  // Insert redemption first (unique code+telegram_id)
   try {
-    const { error: insErr } = await sb.from('promo_redemptions').insert({
-      code: c,
-      telegram_id: tid,
-      user_name: userName,
-      amount: amount
-    });
-    if (insErr) {
-      if (/duplicate|unique/i.test(insErr.message || '')) {
-        throw new Error('You already redeemed this code');
-      }
-      // If table missing, still credit once per server-less best effort
-      console.warn('promo insert:', insErr.message);
-      if (/does not exist|schema cache/i.test(insErr.message || '')) {
-        console.warn('Run SQL to create promo_redemptions table for hard 3-person limit');
-      } else {
-        throw new Error(insErr.message || 'Redeem failed');
-      }
-    }
-  } catch (e) {
-    if (/already redeemed|already used/i.test(e.message || '')) throw e;
-    if (!/does not exist|schema cache/i.test(e.message || '')) {
-      // rethrow unknown
-      if (/Redeem failed|duplicate/i.test(e.message || '')) throw e;
-    }
-  }
+    const { data: pu, error: puErr } = await sb.from('bot_settings').select('value').eq('key', 'promo_user_' + tid).limit(1);
+    if (!puErr && pu && pu[0]) throw new Error('You already used a free wallet promo');
+  } catch (e) { if (/already used/i.test(e.message || '')) throw e; }
 
+  // 2) Atomic claim of the code (unique key in bot_settings) so two people cannot both get a one-person code
+  let claimKey = 'promo_used_' + c;
+  let claimed = false;
+  try {
+    const { data: ex, error: exErr } = await sb.from('bot_settings').select('value').eq('key', claimKey).limit(1);
+    if (!exErr) {
+      if (ex && ex[0]) {
+        if (String(ex[0].value) === tid) throw new Error('You already redeemed this code');
+        throw new Error('This code was already used by someone else');
+      }
+      const { error: cErr } = await sb.from('bot_settings').insert({ key: claimKey, value: tid });
+      if (cErr) {
+        if (/duplicate|unique/i.test(cErr.message || '')) throw new Error('This code was already used by someone else');
+        console.warn('promo claim insert:', cErr.message);
+      } else claimed = true;
+    }
+  } catch (e) { if (/already/i.test(e.message || '')) throw e; console.warn('promo claim:', e.message || e); }
+
+  // 3) Credit the wallet FIRST; only if that works is the code considered used
   const newBal = bal0 + amount;
-  const { error: wErr } = await sb
-    .from('user_wallets')
-    .update({
-      balance: newBal,
-      total_deposits: Number(wallet.total_deposits || 0) + amount
-    })
-    .eq('telegram_id', tid);
-  if (wErr) throw wErr;
+  let wErr = null;
+  {
+    const r1 = await sb.from('user_wallets').update({ balance: newBal, total_deposits: Number(wallet.total_deposits || 0) + amount }).eq('telegram_id', tid);
+    wErr = r1.error;
+    if (wErr) {
+      console.warn('promo wallet update (with total_deposits):', wErr.message);
+      const r2 = await sb.from('user_wallets').update({ balance: newBal }).eq('telegram_id', tid);
+      wErr = r2.error;
+    }
+  }
+  if (wErr) {
+    if (claimed) { try { await sb.from('bot_settings').delete().eq('key', claimKey); } catch (e) {} }
+    throw new Error('Could not credit wallet: ' + (wErr.message || 'unknown'));
+  }
+
+  // 4) Record history (best effort — never blocks the credit)
+  try {
+    const { error: insErr } = await sb.from('promo_redemptions').insert({ code: c, telegram_id: tid, user_name: userName, amount: amount });
+    if (insErr) {
+      const r3 = await sb.from('promo_redemptions').insert({ code: c, telegram_id: tid });
+      if (r3.error) console.warn('promo_redemptions insert:', r3.error.message);
+    }
+  } catch (e) { console.warn('promo history', e.message || e); }
+  // Per-user lock: one free-wallet code per person
+  try { await sb.from('bot_settings').insert({ key: 'promo_user_' + tid, value: c }); } catch (e) {}
 
   try {
     await tg('sendMessage', {
@@ -623,6 +647,33 @@ async function handleBotText(msg) {
     return true;
   }
 
+  // Admin: make THIS group the admin group (deposits / withdrawals / payouts go here)
+  if (lower === '/setadmin' || lower.indexOf('/setadmin@') === 0 || lower === '/admingroup' || lower.indexOf('/admingroup@') === 0) {
+    const isSet = lower.indexOf('/setadmin') === 0;
+    const ids = String(process.env.ADMIN_USER_IDS || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
+    const uid = msg.from && msg.from.id;
+    const ok = uid && (ids.indexOf(String(uid)) >= 0 || (await isAdmin(uid)));
+    if (!ok) { await tg('sendMessage', { chat_id: chatId, text: '⛔ Admin only.' }); return true; }
+    if (!isSet) {
+      await tg('sendMessage', { chat_id: chatId, text: 'የአሁኑ የአድሚን ግሩፕ / Current admin group: ' + ADMIN_CHAT_ID });
+      return true;
+    }
+    const ctype = msg.chat && msg.chat.type;
+    if (ctype !== 'group' && ctype !== 'supergroup') {
+      await tg('sendMessage', { chat_id: chatId, text: 'ይህን ትዕዛዝ በአዲሱ ግሩፕ ውስጥ ላኩ / Send /setadmin inside the new group.' });
+      return true;
+    }
+    const { error } = await db().from('bot_settings').upsert({ key: 'admin_chat_id', value: String(chatId) }, { onConflict: 'key' });
+    if (error) {
+      await tg('sendMessage', { chat_id: chatId, text: '❌ Could not save (create table bot_settings first): ' + error.message });
+      return true;
+    }
+    ADMIN_CHAT_ID = String(chatId);
+    _adminChatLoadedAt = Date.now();
+    await tg('sendMessage', { chat_id: chatId, text: '✅ ይህ ግሩፕ አሁን የአድሚን ግሩፕ ነው / This group is now the admin group.\nID: ' + chatId });
+    return true;
+  }
+
   // Admin: publish ad to channel with Play button
   // /post  or  /post Your custom caption here
   // /postphoto https://example.com/image.jpg Caption text
@@ -892,11 +943,10 @@ async function joinLeagueServer(user, league, gameweek, opts) {
   const tid = String(user.id);
   const userName = [user.first_name, user.last_name].filter(Boolean).join(' ') || 'Manager';
   opts = opts || {};
-  let ENTRY = 100;
-  const rawAmt = Number(opts.amount);
-  if (!isNaN(rawAmt) && rawAmt >= 0 && rawAmt <= 100) ENTRY = Math.round(rawAmt);
-  // Promo codes: never charge more than 100; floor at 0
+  // Entry fee is decided HERE (the client amount is ignored): 100, minus the influencer-code discount if a valid code was sent
   const promo = opts.promo_code ? String(opts.promo_code).toUpperCase() : '';
+  let ENTRY = 100;
+  if (promo && INFLUENCER_PROMOS[promo]) ENTRY = Math.max(0, 100 - Number(INFLUENCER_PROMOS[promo].discount || 0));
   console.log('joinLeagueServer', tid, lg, gw, 'charge', ENTRY, 'promo', promo);
 
   // Prefer dedicated contest_entries table if it exists
@@ -1147,7 +1197,9 @@ async function createWalletRequest(data) {
 }
 
 async function sendDepositRequest(request) {
-  const text =
+  let amharic = '';
+  try { amharic = buildAmharicReceipt(request) + '\n━━━━━━━━━━\n\n'; } catch (e) {}
+  const text = amharic +
     '🚨 NEW DEPOSIT REQUEST\n\n' +
     '👤 User: ' + request.user_name + '\n' +
     '🆔 Telegram ID: ' + request.telegram_id + '\n\n' +
@@ -1465,6 +1517,7 @@ function adminAuthorized(update, req) {
 }
 
 module.exports = async function handler(req, res) {
+  try { await loadAdminChatId(); } catch (e) {}
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -1819,7 +1872,9 @@ module.exports = async function handler(req, res) {
 
         // Merge contest_entries
         try {
-          const ce = await sb.from('contest_entries').select('*').limit(500);
+          let ceq = sb.from('contest_entries').select('*');
+          if (gw) ceq = ceq.eq('gameweek', gw);
+          const ce = await ceq.limit(2000);
           if (ce.data) {
             const byId = {};
             rows.forEach(function (r) { byId[String(r.telegram_id)] = r; });
@@ -1853,18 +1908,20 @@ module.exports = async function handler(req, res) {
         } catch (e) { console.warn('ce merge', e.message || e); }
 
         // Prefer paid or has players
-        function hasPlayers(m) {
+        function hasPlayers(m, minN) {
           var p = m && m.players;
           if (!p) return false;
           if (typeof p === 'string') {
             try { p = JSON.parse(p); } catch (e) { return p.length > 10; }
           }
-          if (Array.isArray(p)) return p.filter(Boolean).length >= 8;
-          if (typeof p === 'object') return Object.keys(p).length >= 8;
+          if (Array.isArray(p)) return p.filter(Boolean).length >= (minN || 8);
+          if (typeof p === 'object') return Object.keys(p).length >= (minN || 8);
           return false;
         }
         var filtered = rows.filter(function (m) {
-          return m && (m.paid === true || m.paid === 't' || m.paid === 1 || m.paid === '1' || m.paid === 'true' || (!gw && hasPlayers(m)));
+          var isPaid = m && (m.paid === true || m.paid === 't' || m.paid === 1 || m.paid === '1' || m.paid === 'true');
+          if (gw) return isPaid && hasPlayers(m, 11); // this GW: paid AND squad saved
+          return isPaid || hasPlayers(m);
         });
         if (!filtered.length && !gw) filtered = rows;
 
@@ -2077,6 +2134,9 @@ module.exports = async function handler(req, res) {
           m._unmatched = unmatched;
           m._empty = players.length === 0;
         });
+
+        // Same rule as the leaderboard: no saved squad = not ranked, no prize
+        rows = rows.filter(function (m) { return !m._empty; });
 
         // Ranking: points, then earlier entry, then name (same tie-break as the leaderboard)
         rows.sort(function (a, b) {
