@@ -647,6 +647,14 @@ async function handleBotText(msg) {
     return true;
   }
 
+  // Admin: money summary (approved / declined deposits & withdrawals)
+  if (lower === '/stats' || lower.indexOf('/stats@') === 0 || lower === '/summary' || lower.indexOf('/summary@') === 0) {
+    if (!isAdminUser(msg)) { await tg('sendMessage', { chat_id: chatId, text: '⛔ Admin only.' }); return true; }
+    try { await tg('sendMessage', { chat_id: chatId, text: formatWalletStats(await getWalletStats()) }); }
+    catch (e) { await tg('sendMessage', { chat_id: chatId, text: '❌ Stats failed: ' + (e.message || e) }); }
+    return true;
+  }
+
   // Admin: make THIS group the admin group (deposits / withdrawals / payouts go here)
   if (lower === '/setadmin' || lower.indexOf('/setadmin@') === 0 || lower === '/admingroup' || lower.indexOf('/admingroup@') === 0) {
     const isSet = lower.indexOf('/setadmin') === 0;
@@ -1381,6 +1389,79 @@ async function rejectRequest(requestId) {
   return request;
 }
 
+// ---- Admin-group money summary: approved / declined deposits & withdrawals ----
+async function getWalletStats() {
+  const sb = db();
+  let rows = [];
+  for (let from = 0; from < 50000; from += 1000) {
+    const { data, error } = await sb.from('wallet_requests').select('*').range(from, from + 999);
+    if (error) throw new Error(error.message);
+    rows = rows.concat(data || []);
+    if (!data || data.length < 1000) break;
+  }
+  const blank = function () { return { approved: { n: 0, sum: 0 }, rejected: { n: 0, sum: 0 }, pending: { n: 0, sum: 0 } }; };
+  const all = { deposit: blank(), withdrawal: blank() };
+  const today = { deposit: blank(), withdrawal: blank() };
+  // "today" = calendar day in Addis Ababa (UTC+3)
+  const dayKey = function (d) { return new Date(new Date(d).getTime() + 3 * 3600 * 1000).toISOString().slice(0, 10); };
+  const todayKey = dayKey(Date.now());
+  rows.forEach(function (r) {
+    const t = String(r.type || r.request_type || '').toLowerCase();
+    if (t !== 'deposit' && t !== 'withdrawal') return;
+    const st = String(r.status || '').toLowerCase();
+    const bucket = (st === 'approved' || st === 'paid') ? 'approved' : (st === 'rejected' || st === 'declined') ? 'rejected' : (st === 'pending' ? 'pending' : null);
+    if (!bucket) return;
+    const amt = Number(r.amount || 0) || 0;
+    all[t][bucket].n++; all[t][bucket].sum += amt;
+    const when = r.processed_at || r.created_at;
+    if (when && dayKey(when) === todayKey) { today[t][bucket].n++; today[t][bucket].sum += amt; }
+  });
+  return { all: all, today: today };
+}
+
+function formatWalletStats(st) {
+  const f = function (x) { return x.n + ' req = ' + (Math.round(x.sum * 100) / 100) + ' ETB'; };
+  const block = function (title, o) {
+    return title + '\n' +
+      '💰 DEPOSITS\n' +
+      '  ✅ Approved: ' + f(o.deposit.approved) + '\n' +
+      '  ❌ Declined: ' + f(o.deposit.rejected) + '\n' +
+      '  ⏳ Pending: ' + f(o.deposit.pending) + '\n' +
+      '💸 WITHDRAWALS\n' +
+      '  ✅ Paid: ' + f(o.withdrawal.approved) + '\n' +
+      '  ❌ Declined: ' + f(o.withdrawal.rejected) + '\n' +
+      '  ⏳ Pending: ' + f(o.withdrawal.pending);
+  };
+  const net = st.all.deposit.approved.sum - st.all.withdrawal.approved.sum;
+  return '📊 WALLET SUMMARY\n\n' + block('📅 TODAY', st.today) + '\n\n' + block('🧾 ALL TIME', st.all) +
+    '\n\n📈 Net (approved deposits − paid withdrawals): ' + (Math.round(net * 100) / 100) + ' ETB';
+}
+
+async function sendWalletStatsToAdmin() {
+  try {
+    const st = await getWalletStats();
+    await tg('sendMessage', { chat_id: ADMIN_CHAT_ID, text: formatWalletStats(st) });
+  } catch (e) { console.warn('wallet stats failed', e && e.message); }
+}
+
+// ---- Admin check for the mini app (admins may edit squads / view all teams after lock) ----
+const APP_ADMIN_IDS = ['-1004468798532'];
+async function isAppAdmin(userId) {
+  const uid = String(userId || '');
+  if (!uid) return false;
+  const env = String(process.env.ADMIN_USER_IDS || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
+  if (env.indexOf(uid) >= 0 || APP_ADMIN_IDS.indexOf(uid) >= 0) return true;
+  if (await isAdmin(userId)) return true; // creator / administrator of the admin group
+  for (let i = 0; i < APP_ADMIN_IDS.length; i++) {
+    if (String(APP_ADMIN_IDS[i]).indexOf('-100') !== 0) continue; // group id: check the user's role there
+    try {
+      const r = await tg('getChatMember', { chat_id: APP_ADMIN_IDS[i], user_id: userId });
+      if (r && r.ok && r.result && (r.result.status === 'creator' || r.result.status === 'administrator')) return true;
+    } catch (e) {}
+  }
+  return false;
+}
+
 async function updateAdminMessage(query, statusText) {
   if (!query.message) return;
   const oldText = query.message.text || '';
@@ -1435,6 +1516,7 @@ async function handleCallback(query) {
         text: '🎉 DEPOSIT APPROVED\n\n💵 Amount: ' + result.amount + ' ETB\n\n💰 New wallet balance:\n' + result.new_balance + ' ETB'
       });
       await updateAdminMessage(query, '✅ STATUS: APPROVED (+' + result.amount + ' ETB)');
+      await sendWalletStatsToAdmin();
     } catch (error) {
       console.error('Deposit approval error:', error);
       await tg('answerCallbackQuery', {
@@ -1455,6 +1537,7 @@ async function handleCallback(query) {
         text: '❌ DEPOSIT REJECTED\n\nYour ' + request.amount + ' ETB deposit could not be verified.'
       });
       await updateAdminMessage(query, '❌ STATUS: REJECTED');
+      await sendWalletStatsToAdmin();
     } catch (error) {
       console.error('Deposit rejection error:', error);
       await tg('answerCallbackQuery', {
@@ -1475,6 +1558,7 @@ async function handleCallback(query) {
         text: '💸 WITHDRAWAL COMPLETED\n\n💵 Amount: ' + result.amount + ' ETB\n\n💰 Remaining balance:\n' + result.new_balance + ' ETB'
       });
       await updateAdminMessage(query, '✅ STATUS: PAID OUT (-' + result.amount + ' ETB)');
+      await sendWalletStatsToAdmin();
     } catch (error) {
       console.error('Withdrawal payment error:', error);
       await tg('answerCallbackQuery', {
@@ -1495,6 +1579,7 @@ async function handleCallback(query) {
         text: '❌ WITHDRAWAL REJECTED\n\nYour ' + request.amount + ' ETB withdrawal was rejected.\nBalance unchanged.'
       });
       await updateAdminMessage(query, '❌ STATUS: REJECTED — BALANCE UNCHANGED');
+      await sendWalletStatsToAdmin();
     } catch (error) {
       console.error('Withdrawal rejection error:', error);
       await tg('answerCallbackQuery', {
@@ -1843,6 +1928,12 @@ module.exports = async function handler(req, res) {
 
     
     
+    if (update.action === 'check_admin') {
+      const user = verifyTelegramInitData(update.initData || req.headers.authorization || '');
+      if (!user) return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
+      return res.status(200).json({ ok: true, admin: await isAppAdmin(user.id) });
+    }
+
     if (update.action === 'get_leaderboard') {
       try {
         const league = String(update.league || 'EPL').toUpperCase();
