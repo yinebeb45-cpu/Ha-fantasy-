@@ -700,12 +700,25 @@ async function handleBotText(msg) {
   }
 
   // Admin: make THIS group the admin group (deposits / withdrawals / payouts go here)
-  if (lower === '/setadmin' || lower.indexOf('/setadmin@') === 0 || lower === '/admingroup' || lower.indexOf('/admingroup@') === 0) {
+  // Anyone: show your own Telegram id and this chat's id (helps set ADMIN_USER_IDS / ADMIN_CHAT_ID)
+  if (lower === '/myid' || lower.indexOf('/myid@') === 0) {
+    await tg('sendMessage', { chat_id: chatId, text: 'Your ID: ' + (msg.from && msg.from.id) + '\nThis chat ID: ' + chatId + '\nCurrent admin group: ' + ADMIN_CHAT_ID });
+    return true;
+  }
+  if (/^\/(setadmin|admingroup)(@\w+)?(\s|$)/.test(lower)) {
     const isSet = lower.indexOf('/setadmin') === 0;
     const ids = String(process.env.ADMIN_USER_IDS || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
     const uid = msg.from && msg.from.id;
-    const ok = uid && (ids.indexOf(String(uid)) >= 0 || (await isAdmin(uid)));
-    if (!ok) { await tg('sendMessage', { chat_id: chatId, text: '⛔ Admin only.' }); return true; }
+    // allowed: listed admin id, admin of the current admin group, or the secret:  /setadmin <SETTLE_SECRET>
+    const arg = (text.split(/\s+/)[1] || '').trim();
+    const secretKey = String(process.env.SETTLE_SECRET || PUBLISH_SECRET || '').trim();
+    const viaSecret = !!(secretKey && arg && arg === secretKey);
+    const ok = viaSecret || (uid && (ids.indexOf(String(uid)) >= 0 || (await isAdmin(uid))));
+    if (viaSecret) { try { await tg('deleteMessage', { chat_id: chatId, message_id: msg.message_id }); } catch (e) {} }
+    if (!ok) {
+      await tg('sendMessage', { chat_id: chatId, text: '⛔ Admin only.\nYour ID: ' + uid + '\nCurrent admin group: ' + ADMIN_CHAT_ID + '\n\nFix: put your ID in Vercel env ADMIN_USER_IDS, or send  /setadmin <SETTLE_SECRET>  in the new group.' });
+      return true;
+    }
     if (!isSet) {
       await tg('sendMessage', { chat_id: chatId, text: 'የአሁኑ የአድሚን ግሩፕ / Current admin group: ' + ADMIN_CHAT_ID });
       return true;
@@ -727,11 +740,11 @@ async function handleBotText(msg) {
   }
 
   // Admin: wallet totals (approved / declined deposits & withdrawals)
-  if (lower === '/totals' || lower.indexOf('/totals@') === 0 || lower === '/stats' || lower.indexOf('/stats@') === 0 || lower === '/status' || lower.indexOf('/status@') === 0) {
+  if (/^\/(totals|stats|status)(@\w+)?(\s|$)/.test(lower)) {
     const ids2 = String(process.env.ADMIN_USER_IDS || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
     const uid2 = msg.from && msg.from.id;
     const ok2 = isAdminUser(msg) || (uid2 && (ids2.indexOf(String(uid2)) >= 0 || (await isAdmin(uid2))));
-    if (!ok2) { await tg('sendMessage', { chat_id: chatId, text: '⛔ Admin only.' }); return true; }
+    if (!ok2) { await tg('sendMessage', { chat_id: chatId, text: '⛔ Admin only.\nYour ID: ' + uid2 + '\nCurrent admin group: ' + ADMIN_CHAT_ID + '\n\nFix: put your ID in Vercel env ADMIN_USER_IDS (comma separated).' }); return true; }
     try { await tg('sendMessage', { chat_id: chatId, text: await buildWalletTotals() }); }
     catch (e) { await tg('sendMessage', { chat_id: chatId, text: '❌ ' + (e.message || 'failed') }); }
     return true;
@@ -1629,7 +1642,7 @@ module.exports = async function handler(req, res) {
     return res.status(200).end();
   }
 
-  console.log('ለ Fantasy API version: 2026-10-04-v6-bot-menu');
+  console.log('ለ Fantasy API version: 2026-11-14-v7-admin-totals');
 
   if (req.method === 'GET') {
     // Health check for browser / Vercel — never throw
@@ -1638,6 +1651,7 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({
         ok: true,
         service: 'le-fantasy-telegram',
+        version: '2026-11-14-v7-admin-totals',
         bot: BOT_TOKEN ? 'token_set' : 'token_missing',
         supabase: (SUPABASE_URL && SUPABASE_SERVICE_KEY) ? 'env_set' : 'env_missing',
         mini_app: MINI_APP_URL
@@ -2417,25 +2431,4 @@ if (update.action === 'settle_gw_prize') {
 
         try {
           await tg('sendMessage', {
-            chat_id: tid,
-            text: '🏆 GW' + gw + ' ' + league + ' prize!\nRank #' + rank + '\n+' + prize + ' ETB added to your wallet.\nBalance: ' + newBal + ' ETB'
-          });
-        } catch (e) {}
-
-        return res.status(200).json({ ok: true, balance: newBal, amount: prize, rank: rank });
-      } catch (e) {
-        console.error('settle_gw_prize', e);
-        return res.status(400).json({ ok: false, error: e.message || 'Settle failed' });
-      }
-    }
-
-if (update.action === 'is_admin') {
-      const user = verifyTelegramInitData(update.initData || '');
-      if (!user) return res.status(200).json({ ok: true, admin: false });
-      const ids3 = String(process.env.ADMIN_USER_IDS || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
-      let adm = ids3.indexOf(String(user.id)) >= 0;
-      if (!adm) { try { adm = await isAdmin(user.id); } catch (e) { adm = false; } }
-      return res.status(200).json({ ok: true, admin: !!adm });
-    }
-
-if (
+      
