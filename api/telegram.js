@@ -719,6 +719,12 @@ async function handleBotText(msg) {
     return true;
   }
 
+  // Anyone: show IDs (to set ADMIN_USER_IDS / find the admin group id)
+  if (lower === '/id' || lower.indexOf('/id@') === 0) {
+    await tg('sendMessage', { chat_id: chatId, text: 'Your ID: ' + (msg.from && msg.from.id) + '\nThis chat ID: ' + chatId + '\nCurrent admin group: ' + ADMIN_CHAT_ID });
+    return true;
+  }
+
   // Admin: money summary (approved / declined deposits & withdrawals)
   if (lower === '/stats' || lower.indexOf('/stats@') === 0 || lower === '/summary' || lower.indexOf('/summary@') === 0) {
     if (!isAdminUser(msg)) { await tg('sendMessage', { chat_id: chatId, text: '⛔ Admin only.' }); return true; }
@@ -1685,7 +1691,7 @@ module.exports = async function handler(req, res) {
     return res.status(200).end();
   }
 
-  console.log('ለ Fantasy API version: 2026-10-04-v6-bot-menu');
+  console.log('ለ Fantasy API version: 2026-11-14-v7-ads-fix');
 
   if (req.method === 'GET') {
     // Health check for browser / Vercel — never throw
@@ -1694,6 +1700,8 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({
         ok: true,
         service: 'le-fantasy-telegram',
+        version: 'v7-ads-fix',
+        admin_chat: ADMIN_CHAT_ID,
         bot: BOT_TOKEN ? 'token_set' : 'token_missing',
         supabase: (SUPABASE_URL && SUPABASE_SERVICE_KEY) ? 'env_set' : 'env_missing',
         mini_app: MINI_APP_URL
@@ -2446,11 +2454,4 @@ if (update.action === 'settle_gw_prize') {
             .select('id')
             .eq('telegram_id', tid)
             .eq('league', league)
-            .eq('gameweek', gw)
-            .maybeSingle();
-          if (existing) {
-            const w = await getWallet(tid, [user.first_name, user.last_name].filter(Boolean).join(' ') || 'Manager');
-            return res.status(200).json({ ok: true, balance: Number(w.balance || 0), already: true });
-          }
-        } catch (e) {
-          console.warn('prize_settlements lookup', e.message || e
+            .eq('gam
