@@ -3,7 +3,7 @@
  *
  * Vercel Environment Variables:
  *   BOT_TOKEN              = your bot token
- *   ADMIN_CHAT_ID          = -1004436177839
+ *   ADMIN_CHAT_ID          = -1004468798532
  *   CHANNEL_ID             = @lefantasychannel  (bot must be channel admin)
  *   BOT_USERNAME           = Lefantasy_bot
  *   PUBLISH_SECRET         = random string for auto-post URL
@@ -18,7 +18,7 @@
 const crypto = require('crypto');
 
 const BOT_TOKEN = (process.env.BOT_TOKEN || '').trim();
-const ENV_ADMIN_CHAT_ID = String(process.env.ADMIN_CHAT_ID || '-1004436177839').trim();
+const ENV_ADMIN_CHAT_ID = String(process.env.ADMIN_CHAT_ID || '-1004468798532').trim();
 // Admin group can be switched at any time with /setadmin (saved in table bot_settings); falls back to the env value
 let ADMIN_CHAT_ID = ENV_ADMIN_CHAT_ID;
 let _adminChatLoadedAt = 0;
@@ -36,19 +36,31 @@ async function loadAdminChatId() {
 // Telebirr SMS (Amharic or English) -> readable Amharic receipt summary for the admin group
 function buildAmharicReceipt(request) {
   const raw = String(request.receipt || '');
-  const amtM = raw.match(/([\d,]+(?:\.\d+)?)\s*(?:ብር|birr|etb)/i);
+  const p = parseTelebirrSms(raw) || {};
   const dateM = raw.match(/(\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2}:\d{2})/);
   const linkM = raw.match(/https?:\/\/\S+/);
-  const txn = extractTxnId(raw);
-  const paid = amtM ? Number(String(amtM[1]).replace(/,/g, '')) : null;
+  const txn = p.txn || extractTxnId(raw);
+  const paid = p.amount != null ? p.amount : null;
   const asked = Number(request.amount);
   let t = '🧾 የቴሌብር ደረሰኝ (Telebirr)\n\n' +
-    '👤 ተጠቃሚ: ' + (request.user_name || '—') + '\n' +
-    '💵 የተጠየቀ መጠን: ' + asked + ' ብር\n';
+    '👤 ተጠቃሚ (በመተግበሪያው): ' + (request.user_name || '—') + '\n';
+  if (p.sender) t += '✍️ ላኪ (በደረሰኙ ላይ): ' + p.sender + '\n';
+  if (p.recipient) t += '➡️ ተቀባይ: ' + p.recipient + (p.phone ? ' (' + p.phone + ')' : '') + '\n';
+  t += '💵 የተጠየቀ መጠን: ' + asked + ' ብር\n';
   if (paid != null) t += '💰 በደረሰኙ የተላከ: ' + paid + ' ብር\n';
   if (dateM) t += '🕒 ቀን: ' + dateM[1] + '\n';
-  if (txn) t += '🔖 የሂሳብ እንቅስቃሴ ቁጥር: ' + txn + '\n';
+  if (txn) t += '🔖 የሂሳብ እንቅስቃሴ ቁጥርዎ: ' + txn + '\n';
   if (linkM) t += '🔗 ' + linkM[0] + '\n';
+  const ok = [];
+  if (p.lang === 'am') {
+    ok.push((p.sender ? '✅' : '❌') + ' ስም (ውድ …)');
+    ok.push((/dawit/i.test(p.recipient || '') && /5640$/.test(p.phone || '') ? '✅' : '❌') + ' ተቀባይ Dawit …5640');
+    ok.push((paid != null && Math.abs(paid - asked) <= 0.05 ? '✅' : '❌') + ' መጠን ይመሳሰላል');
+    ok.push((txn && (!p.linkTxn || p.linkTxn === txn) ? '✅' : '❌') + ' የግብይት ቁጥር ከሊንኩ ጋር ይመሳሰላል');
+    ok.push((p.hasLink ? '✅' : '❌') + ' የቴሌብር ሊንክ');
+    if (p.when) { const age = Date.now() - p.when.getTime(); ok.push((age > -600000 && age < 3 * 86400000 ? '✅' : '❌') + ' ቀን አዲስ ነው (≤3 ቀን)'); }
+    t += '\n🔎 ማረጋገጫ:\n' + ok.join('\n') + '\n';
+  }
   if (paid != null && Number.isFinite(asked) && paid !== asked) t += '\n⚠️ ማስጠንቀቂያ: በደረሰኙ ላይ ያለው መጠን ከተጠየቀው ጋር አይመሳሰልም!\n';
   if (!txn) t += '\n⚠️ የግብይት ቁጥር አልተገኘም — ደረሰኙን በእጅ ያረጋግጡ።\n';
   return t;
@@ -165,15 +177,59 @@ const INFLUENCER_PROMOS = {
 };
 
 
+// Parse a Telebirr SMS (Amharic or English) into fields; null when it is not a Telebirr "money sent" SMS
+function parseTelebirrSms(text) {
+  const t = String(text || '');
+  if (/ብር/.test(t) && /ልከዋል/.test(t)) {
+    const name = (t.match(/ውድ\s*([^\n\r]+?)\s*(?:\r?\n|ወደ)/) || [])[1] || '';
+    const to = t.match(/ወደ\s+(.+?)\s*\(\s*([0-9*]+)\s*\)/);
+    const amt = t.match(/([0-9][0-9,]*(?:\.[0-9]+)?)\s*ብር\s*በ\s*(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2}):(\d{2})/);
+    const txn = (t.match(/ቁጥርዎ\s*[:\s]*([A-Za-z0-9]{6,})/) || [])[1] || '';
+    const linkTxn = (t.match(/receipt\/([A-Za-z0-9]+)/i) || [])[1] || '';
+    let when = null;
+    if (amt) when = new Date(Date.UTC(+amt[4], +amt[3] - 1, +amt[2], +amt[5] - 3, +amt[6], +amt[7])); // SMS time is EAT (UTC+3)
+    return {
+      lang: 'am', sender: name.trim(), recipient: to ? to[1].trim() : '', phone: to ? to[2] : '',
+      amount: amt ? parseFloat(amt[1].replace(/,/g, '')) : null, when: when, txn: txn.toUpperCase(), linkTxn: linkTxn.toUpperCase(),
+      hasLink: /transactioninfo\.ethiotelecom\.et/i.test(t)
+    };
+  }
+  if (/transferred\s+etb/i.test(t)) {
+    const amt = t.match(/ETB\s*([0-9]+(?:\.[0-9]+)?)/i);
+    return { lang: 'en', amount: amt ? parseFloat(amt[1]) : null, txn: (extractTxnId(t) || ''), linkTxn: ((t.match(/receipt\/([A-Za-z0-9]+)/i) || [])[1] || '').toUpperCase() };
+  }
+  return null;
+}
+
 function assertDepositReceipt(receipt, amount) {
   const text = String(receipt || '');
   if (!text.trim()) throw new Error('Receipt required');
   if (/COMMERCIAL BANK|CBE ACCOUNT|BANK TRANSACTION NUMBER|ACCOUNT NUMBER\s*\d{8,}/i.test(text)) {
     throw new Error('Bank transfer receipts are not accepted. Send Telebirr to Dawit Gebremicael 251996465640.');
   }
-  if (!/transferred\s+etb/i.test(text)) {
-    throw new Error('Invalid Telebirr SMS format');
+  const p = parseTelebirrSms(text);
+  if (!p) throw new Error('Invalid Telebirr SMS format');
+
+  if (p.lang === 'am') {
+    if (!p.sender) throw new Error('Receipt must start with ውድ <name>');
+    if (!/dawit/i.test(p.recipient) || !/(gmikael|gebremicael|gebremikael|gebre)/i.test(p.recipient)) {
+      throw new Error('Receipt must show transfer TO Dawit Gmikael / Gebremicael');
+    }
+    if (!/5640\s*$/.test(p.phone) || !/^2519/.test(p.phone)) {
+      throw new Error('Receipt phone number must be 2519****5640');
+    }
+    if (p.amount == null || p.when == null) throw new Error('Receipt amount/date not found');
+    if (Number.isFinite(amount) && Math.abs(p.amount - Number(amount)) > 0.05) throw new Error('Receipt amount does not match');
+    if (p.amount > 200) throw new Error('Max deposit 200 ETB');
+    if (!p.txn) throw new Error('Transaction number (የሂሳብ እንቅስቃሴ ቁጥርዎ) not found');
+    if (p.linkTxn && p.linkTxn !== p.txn) throw new Error('Transaction number does not match the receipt link');
+    if (!p.hasLink) throw new Error('Receipt link (transactioninfo.ethiotelecom.et) is missing');
+    const age = Date.now() - p.when.getTime();
+    if (age < -10 * 60 * 1000) throw new Error('Receipt date is in the future');
+    if (age > 3 * 24 * 3600 * 1000) throw new Error('Receipt is older than 3 days');
+    return true;
   }
+
   if (!/to\s+dawit(\s+gebremicael)?/i.test(text) && !/to\s+gebremicael/i.test(text)) {
     throw new Error('Receipt must show transfer TO Dawit Gebremicael (not only Dear Dawit)');
   }
@@ -183,13 +239,9 @@ function assertDepositReceipt(receipt, amount) {
   if (fromOur && !toOur) {
     throw new Error('SMS shows money sent FROM our number, not a deposit TO us');
   }
-  const m = text.match(/ETB\s*([0-9]+(?:\.[0-9]+)?)/i);
-  if (m) {
-    const smsAmt = parseFloat(m[1]);
-    if (Number.isFinite(amount) && Math.abs(smsAmt - Number(amount)) > 0.05) {
-      throw new Error('Receipt amount does not match');
-    }
-    if (smsAmt > 200) throw new Error('Max deposit 200 ETB');
+  if (p.amount != null) {
+    if (Number.isFinite(amount) && Math.abs(p.amount - Number(amount)) > 0.05) throw new Error('Receipt amount does not match');
+    if (p.amount > 200) throw new Error('Max deposit 200 ETB');
   }
   return true;
 }
@@ -647,14 +699,6 @@ async function handleBotText(msg) {
     return true;
   }
 
-  // Admin: money summary (approved / declined deposits & withdrawals)
-  if (lower === '/stats' || lower.indexOf('/stats@') === 0 || lower === '/summary' || lower.indexOf('/summary@') === 0) {
-    if (!isAdminUser(msg)) { await tg('sendMessage', { chat_id: chatId, text: '⛔ Admin only.' }); return true; }
-    try { await tg('sendMessage', { chat_id: chatId, text: formatWalletStats(await getWalletStats()) }); }
-    catch (e) { await tg('sendMessage', { chat_id: chatId, text: '❌ Stats failed: ' + (e.message || e) }); }
-    return true;
-  }
-
   // Admin: make THIS group the admin group (deposits / withdrawals / payouts go here)
   if (lower === '/setadmin' || lower.indexOf('/setadmin@') === 0 || lower === '/admingroup' || lower.indexOf('/admingroup@') === 0) {
     const isSet = lower.indexOf('/setadmin') === 0;
@@ -679,6 +723,17 @@ async function handleBotText(msg) {
     ADMIN_CHAT_ID = String(chatId);
     _adminChatLoadedAt = Date.now();
     await tg('sendMessage', { chat_id: chatId, text: '✅ ይህ ግሩፕ አሁን የአድሚን ግሩፕ ነው / This group is now the admin group.\nID: ' + chatId });
+    return true;
+  }
+
+  // Admin: wallet totals (approved / declined deposits & withdrawals)
+  if (lower === '/totals' || lower.indexOf('/totals@') === 0 || lower === '/stats' || lower.indexOf('/stats@') === 0 || lower === '/status' || lower.indexOf('/status@') === 0) {
+    const ids2 = String(process.env.ADMIN_USER_IDS || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
+    const uid2 = msg.from && msg.from.id;
+    const ok2 = isAdminUser(msg) || (uid2 && (ids2.indexOf(String(uid2)) >= 0 || (await isAdmin(uid2))));
+    if (!ok2) { await tg('sendMessage', { chat_id: chatId, text: '⛔ Admin only.' }); return true; }
+    try { await tg('sendMessage', { chat_id: chatId, text: await buildWalletTotals() }); }
+    catch (e) { await tg('sendMessage', { chat_id: chatId, text: '❌ ' + (e.message || 'failed') }); }
     return true;
   }
 
@@ -884,7 +939,9 @@ async function isAdmin(userId) {
 function extractTxnId(receipt) {
   if (!receipt) return null;
   const text = String(receipt);
-  let m = text.match(/transaction number is\s*[:\s]*([A-Za-z0-9]+)/i);
+  let m = text.match(/ቁጥርዎ\s*[:\s]*([A-Za-z0-9]{6,})/);
+  if (m) return m[1].toUpperCase();
+  m = text.match(/transaction number is\s*[:\s]*([A-Za-z0-9]+)/i);
   if (m) return m[1].toUpperCase();
   m = text.match(/txn(?:\s*id|\s*no|#)?\s*[:\s]*([A-Za-z0-9]+)/i);
   if (m) return m[1].toUpperCase();
@@ -1389,79 +1446,6 @@ async function rejectRequest(requestId) {
   return request;
 }
 
-// ---- Admin-group money summary: approved / declined deposits & withdrawals ----
-async function getWalletStats() {
-  const sb = db();
-  let rows = [];
-  for (let from = 0; from < 50000; from += 1000) {
-    const { data, error } = await sb.from('wallet_requests').select('*').range(from, from + 999);
-    if (error) throw new Error(error.message);
-    rows = rows.concat(data || []);
-    if (!data || data.length < 1000) break;
-  }
-  const blank = function () { return { approved: { n: 0, sum: 0 }, rejected: { n: 0, sum: 0 }, pending: { n: 0, sum: 0 } }; };
-  const all = { deposit: blank(), withdrawal: blank() };
-  const today = { deposit: blank(), withdrawal: blank() };
-  // "today" = calendar day in Addis Ababa (UTC+3)
-  const dayKey = function (d) { return new Date(new Date(d).getTime() + 3 * 3600 * 1000).toISOString().slice(0, 10); };
-  const todayKey = dayKey(Date.now());
-  rows.forEach(function (r) {
-    const t = String(r.type || r.request_type || '').toLowerCase();
-    if (t !== 'deposit' && t !== 'withdrawal') return;
-    const st = String(r.status || '').toLowerCase();
-    const bucket = (st === 'approved' || st === 'paid') ? 'approved' : (st === 'rejected' || st === 'declined') ? 'rejected' : (st === 'pending' ? 'pending' : null);
-    if (!bucket) return;
-    const amt = Number(r.amount || 0) || 0;
-    all[t][bucket].n++; all[t][bucket].sum += amt;
-    const when = r.processed_at || r.created_at;
-    if (when && dayKey(when) === todayKey) { today[t][bucket].n++; today[t][bucket].sum += amt; }
-  });
-  return { all: all, today: today };
-}
-
-function formatWalletStats(st) {
-  const f = function (x) { return x.n + ' req = ' + (Math.round(x.sum * 100) / 100) + ' ETB'; };
-  const block = function (title, o) {
-    return title + '\n' +
-      '💰 DEPOSITS\n' +
-      '  ✅ Approved: ' + f(o.deposit.approved) + '\n' +
-      '  ❌ Declined: ' + f(o.deposit.rejected) + '\n' +
-      '  ⏳ Pending: ' + f(o.deposit.pending) + '\n' +
-      '💸 WITHDRAWALS\n' +
-      '  ✅ Paid: ' + f(o.withdrawal.approved) + '\n' +
-      '  ❌ Declined: ' + f(o.withdrawal.rejected) + '\n' +
-      '  ⏳ Pending: ' + f(o.withdrawal.pending);
-  };
-  const net = st.all.deposit.approved.sum - st.all.withdrawal.approved.sum;
-  return '📊 WALLET SUMMARY\n\n' + block('📅 TODAY', st.today) + '\n\n' + block('🧾 ALL TIME', st.all) +
-    '\n\n📈 Net (approved deposits − paid withdrawals): ' + (Math.round(net * 100) / 100) + ' ETB';
-}
-
-async function sendWalletStatsToAdmin() {
-  try {
-    const st = await getWalletStats();
-    await tg('sendMessage', { chat_id: ADMIN_CHAT_ID, text: formatWalletStats(st) });
-  } catch (e) { console.warn('wallet stats failed', e && e.message); }
-}
-
-// ---- Admin check for the mini app (admins may edit squads / view all teams after lock) ----
-const APP_ADMIN_IDS = ['-1004468798532'];
-async function isAppAdmin(userId) {
-  const uid = String(userId || '');
-  if (!uid) return false;
-  const env = String(process.env.ADMIN_USER_IDS || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
-  if (env.indexOf(uid) >= 0 || APP_ADMIN_IDS.indexOf(uid) >= 0) return true;
-  if (await isAdmin(userId)) return true; // creator / administrator of the admin group
-  for (let i = 0; i < APP_ADMIN_IDS.length; i++) {
-    if (String(APP_ADMIN_IDS[i]).indexOf('-100') !== 0) continue; // group id: check the user's role there
-    try {
-      const r = await tg('getChatMember', { chat_id: APP_ADMIN_IDS[i], user_id: userId });
-      if (r && r.ok && r.result && (r.result.status === 'creator' || r.result.status === 'administrator')) return true;
-    } catch (e) {}
-  }
-  return false;
-}
-
 async function updateAdminMessage(query, statusText) {
   if (!query.message) return;
   const oldText = query.message.text || '';
@@ -1471,6 +1455,40 @@ async function updateAdminMessage(query, statusText) {
     text: oldText + '\n\n' + statusText,
     reply_markup: { inline_keyboard: [] }
   });
+}
+
+// ---- Wallet totals (approved / declined / pending deposits & withdrawals) for the admin group ----
+async function buildWalletTotals() {
+  const sb = db();
+  const { data, error } = await sb.from('wallet_requests').select('*').limit(5000);
+  if (error) throw new Error(error.message || 'wallet_requests read failed');
+  const eat = function (d) { return new Date(new Date(d).getTime() + 3 * 3600 * 1000).toISOString().slice(0, 10); };
+  const todayKey = eat(Date.now());
+  const mk = function () { return { n: 0, sum: 0 }; };
+  const blank = function () { return { dep: { ok: mk(), no: mk(), wait: mk() }, wit: { ok: mk(), no: mk(), wait: mk() } }; };
+  const all = blank(), today = blank();
+  (data || []).forEach(function (r) {
+    const t = String(r.type || r.request_type || '').toLowerCase();
+    const kind = t.indexOf('with') === 0 ? 'wit' : (t.indexOf('dep') === 0 ? 'dep' : null);
+    if (!kind) return;
+    const st = String(r.status || '').toLowerCase();
+    const bucket = (st === 'approved' || st === 'paid') ? 'ok' : (st === 'rejected' || st === 'declined') ? 'no' : (st === 'pending' ? 'wait' : null);
+    if (!bucket) return;
+    const amt = Number(r.amount || 0) || 0;
+    all[kind][bucket].n++; all[kind][bucket].sum += amt;
+    const when = r.processed_at || r.created_at;
+    if (when && eat(when) === todayKey) { today[kind][bucket].n++; today[kind][bucket].sum += amt; }
+  });
+  const f = function (b) { return b.n + ' ጊዜ · ' + Math.round(b.sum * 100) / 100 + ' ETB'; };
+  const block = function (title, x) {
+    return title + '\n' +
+      '📥 ገቢ (Deposits)\n   ✅ የጸደቀ: ' + f(x.dep.ok) + '\n   ❌ ውድቅ: ' + f(x.dep.no) + '\n   ⏳ በመጠባበቅ ላይ: ' + f(x.dep.wait) + '\n' +
+      '📤 ወጪ (Withdrawals)\n   ✅ የተከፈለ: ' + f(x.wit.ok) + '\n   ❌ ውድቅ: ' + f(x.wit.no) + '\n   ⏳ በመጠባበቅ ላይ: ' + f(x.wit.wait);
+  };
+  return '📊 የገንዘብ ማጠቃለያ / Wallet totals\n\n' + block('📅 ዛሬ / Today', today) + '\n\n' + block('🗂 ጠቅላላ / All time', all);
+}
+async function postWalletTotals() {
+  try { await tg('sendMessage', { chat_id: ADMIN_CHAT_ID, text: await buildWalletTotals() }); } catch (e) { console.warn('postWalletTotals', e.message || e); }
 }
 
 async function handleCallback(query) {
@@ -1516,7 +1534,7 @@ async function handleCallback(query) {
         text: '🎉 DEPOSIT APPROVED\n\n💵 Amount: ' + result.amount + ' ETB\n\n💰 New wallet balance:\n' + result.new_balance + ' ETB'
       });
       await updateAdminMessage(query, '✅ STATUS: APPROVED (+' + result.amount + ' ETB)');
-      await sendWalletStatsToAdmin();
+      await postWalletTotals();
     } catch (error) {
       console.error('Deposit approval error:', error);
       await tg('answerCallbackQuery', {
@@ -1537,7 +1555,7 @@ async function handleCallback(query) {
         text: '❌ DEPOSIT REJECTED\n\nYour ' + request.amount + ' ETB deposit could not be verified.'
       });
       await updateAdminMessage(query, '❌ STATUS: REJECTED');
-      await sendWalletStatsToAdmin();
+      await postWalletTotals();
     } catch (error) {
       console.error('Deposit rejection error:', error);
       await tg('answerCallbackQuery', {
@@ -1558,7 +1576,7 @@ async function handleCallback(query) {
         text: '💸 WITHDRAWAL COMPLETED\n\n💵 Amount: ' + result.amount + ' ETB\n\n💰 Remaining balance:\n' + result.new_balance + ' ETB'
       });
       await updateAdminMessage(query, '✅ STATUS: PAID OUT (-' + result.amount + ' ETB)');
-      await sendWalletStatsToAdmin();
+      await postWalletTotals();
     } catch (error) {
       console.error('Withdrawal payment error:', error);
       await tg('answerCallbackQuery', {
@@ -1579,7 +1597,7 @@ async function handleCallback(query) {
         text: '❌ WITHDRAWAL REJECTED\n\nYour ' + request.amount + ' ETB withdrawal was rejected.\nBalance unchanged.'
       });
       await updateAdminMessage(query, '❌ STATUS: REJECTED — BALANCE UNCHANGED');
-      await sendWalletStatsToAdmin();
+      await postWalletTotals();
     } catch (error) {
       console.error('Withdrawal rejection error:', error);
       await tg('answerCallbackQuery', {
@@ -1928,12 +1946,6 @@ module.exports = async function handler(req, res) {
 
     
     
-    if (update.action === 'check_admin') {
-      const user = verifyTelegramInitData(update.initData || req.headers.authorization || '');
-      if (!user) return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
-      return res.status(200).json({ ok: true, admin: await isAppAdmin(user.id) });
-    }
-
     if (update.action === 'get_leaderboard') {
       try {
         const league = String(update.league || 'EPL').toUpperCase();
@@ -2417,54 +2429,13 @@ if (update.action === 'settle_gw_prize') {
       }
     }
 
-if (update.action === 'redeem_promo') {
-      const initData = update.initData || '';
-      const user = verifyTelegramInitData(initData);
-      if (!user) {
-        return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
-      }
-      try {
-        const result = await redeemWalletPromoCode(user, update.code);
-        return res.status(200).json({
-          ok: true,
-          balance: result.balance,
-          amount: result.amount,
-          code: result.code,
-          message: '+' + result.amount + ' ETB credited'
-        });
-      } catch (e) {
-        console.error('redeem_promo:', e);
-        return res.status(400).json({ ok: false, error: e.message || 'Redeem failed' });
-      }
+if (update.action === 'is_admin') {
+      const user = verifyTelegramInitData(update.initData || '');
+      if (!user) return res.status(200).json({ ok: true, admin: false });
+      const ids3 = String(process.env.ADMIN_USER_IDS || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
+      let adm = ids3.indexOf(String(user.id)) >= 0;
+      if (!adm) { try { adm = await isAdmin(user.id); } catch (e) { adm = false; } }
+      return res.status(200).json({ ok: true, admin: !!adm });
     }
 
-    if (update.action === 'join_league') {
-      const initData = update.initData || '';
-      const user = verifyTelegramInitData(initData);
-      if (!user) {
-        return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
-      }
-      try {
-        const result = await joinLeagueServer(user, update.league, update.gameweek || 1, { amount: update.amount, promo_code: update.promo_code });
-        return res.status(200).json({
-          ok: true,
-          already: !!result.already,
-          league: result.league,
-          balance: result.balance,
-          charged: result.charged || 0,
-          message: result.already
-            ? 'Already joined this league this week.'
-            : 'Joined ' + result.league + '. ' + (result.charged || 0) + ' ETB deducted.'
-        });
-      } catch (e) {
-        console.error('join_league error:', e);
-        return res.status(400).json({ ok: false, error: e.message || 'Join failed' });
-      }
-    }
-
-    return res.status(200).json({ ok: true });
-  } catch (error) {
-    console.error('ለ Fantasy API error:', error);
-    return res.status(500).json({ ok: false, error: error.message || 'Server error' });
-  }
-};
+if (
