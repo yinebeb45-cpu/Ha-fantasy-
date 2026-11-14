@@ -34,22 +34,58 @@ async function loadAdminChatId() {
 }
 
 // Telebirr SMS (Amharic or English) -> readable Amharic receipt summary for the admin group
+// Reads a Telebirr SMS (Amharic OR English) -> { lang, sender, receiver, phone, amount, date, txn, link }
+function parseTelebirr(raw) {
+  const text = String(raw || '').replace(/\r/g, '');
+  const out = { lang: null, sender: null, receiver: null, phone: null, amount: null, date: null, txn: null, link: null };
+  const linkM = text.match(/https?:\/\/\S+/);
+  if (linkM) out.link = linkM[0];
+  const dateM = text.match(/(\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2}:\d{2})/);
+  if (dateM) out.date = dateM[1];
+  const toNum = function (x) { return Number(String(x).replace(/,/g, '')); };
+
+  // Amharic: "ውድ NAME \n ወደ RECEIVER(2519****5640) 100.00 ብር በ 06/11/2026 ... ልከዋል። የሂሳብ እንቅስቃሴ ቁጥርዎ TXN ነዉ"
+  const am = text.match(/ወደ\s+([^()\n]+?)\s*\(\s*([\d*+\s]+?)\s*\)\s*([\d,]+(?:\.\d+)?)\s*ብር/);
+  if (am && /ልከዋል/.test(text)) {
+    out.lang = 'am';
+    out.receiver = am[1].trim();
+    out.phone = am[2].replace(/\s+/g, '');
+    out.amount = toNum(am[3]);
+    const sm = text.match(/ውድ\s*([^\n]+)/);
+    if (sm) out.sender = sm[1].trim();
+    const tm = text.match(/የሂሳብ\s*እንቅስቃሴ\s*ቁጥርዎ\s*:?\s*([A-Za-z0-9]+)/);
+    if (tm) out.txn = tm[1].toUpperCase();
+    return out;
+  }
+
+  // English
+  if (/transferred\s+etb/i.test(text)) {
+    out.lang = 'en';
+    const a = text.match(/transferred\s+ETB\s*([\d,]+(?:\.\d+)?)/i);
+    if (a) out.amount = toNum(a[1]);
+    const r = text.match(/\bto\s+([A-Za-z][^()\n]*?)\s*\(\s*([\d*+\s]+?)\s*\)/i);
+    if (r) { out.receiver = r[1].trim(); out.phone = r[2].replace(/\s+/g, ''); }
+    else { const r2 = text.match(/\bto\s+(dawit[^\n.,(]*)/i); if (r2) out.receiver = r2[1].trim(); }
+    const sm = text.match(/Dear\s+([^\n,]+)/i);
+    if (sm) out.sender = sm[1].trim();
+  }
+  return out;
+}
+
 function buildAmharicReceipt(request) {
   const raw = String(request.receipt || '');
-  const amtM = raw.match(/([\d,]+(?:\.\d+)?)\s*(?:ብር|birr|etb)/i);
-  const dateM = raw.match(/(\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2}:\d{2})/);
-  const linkM = raw.match(/https?:\/\/\S+/);
+  const p = parseTelebirr(raw);
   const txn = extractTxnId(raw);
-  const paid = amtM ? Number(String(amtM[1]).replace(/,/g, '')) : null;
   const asked = Number(request.amount);
-  let t = '🧾 የቴሌብር ደረሰኝ (Telebirr)\n\n' +
-    '👤 ተጠቃሚ: ' + (request.user_name || '—') + '\n' +
-    '💵 የተጠየቀ መጠን: ' + asked + ' ብር\n';
-  if (paid != null) t += '💰 በደረሰኙ የተላከ: ' + paid + ' ብር\n';
-  if (dateM) t += '🕒 ቀን: ' + dateM[1] + '\n';
-  if (txn) t += '🔖 የሂሳብ እንቅስቃሴ ቁጥር: ' + txn + '\n';
-  if (linkM) t += '🔗 ' + linkM[0] + '\n';
-  if (paid != null && Number.isFinite(asked) && paid !== asked) t += '\n⚠️ ማስጠንቀቂያ: በደረሰኙ ላይ ያለው መጠን ከተጠየቀው ጋር አይመሳሰልም!\n';
+  const paid = (p.amount != null && Number.isFinite(p.amount)) ? p.amount : null;
+  const shownAmt = paid != null ? paid : asked;
+  let t = 'ውድ ' + (p.sender || request.user_name || '—') + '\n' +
+    'ወደ ' + (p.receiver || '—') + '(' + (p.phone || '—') + ') ' + (Number.isFinite(shownAmt) ? shownAmt.toFixed(2) : '—') + ' ብር\n';
+  if (p.date) t += '🕒 ቀን: ' + p.date + '\n';
+  t += 'የሂሳብ እንቅስቃሴ ቁጥርዎ ' + (txn || '—') + '\n';
+  if (p.link) t += '🔗 ' + p.link + '\n';
+  t += '\n💵 የተጠየቀ መጠን: ' + asked + ' ብር\n';
+  if (paid != null && Number.isFinite(asked) && Math.abs(paid - asked) > 0.05) t += '\n⚠️ ማስጠንቀቂያ: በደረሰኙ ላይ ያለው መጠን ከተጠየቀው ጋር አይመሳሰልም!\n';
   if (!txn) t += '\n⚠️ የግብይት ቁጥር አልተገኘም — ደረሰኙን በእጅ ያረጋግጡ።\n';
   return t;
 }
@@ -170,6 +206,19 @@ function assertDepositReceipt(receipt, amount) {
   if (!text.trim()) throw new Error('Receipt required');
   if (/COMMERCIAL BANK|CBE ACCOUNT|BANK TRANSACTION NUMBER|ACCOUNT NUMBER\s*\d{8,}/i.test(text)) {
     throw new Error('Bank transfer receipts are not accepted. Send Telebirr to Dawit Gebremicael 251996465640.');
+  }
+  const pa = parseTelebirr(text);
+  if (pa.lang === 'am') {
+    if (!/dawit/i.test(pa.receiver || '') && !/5640$/.test(pa.phone || '')) {
+      throw new Error('Receipt must show transfer TO Dawit Gebremicael (2519****5640)');
+    }
+    if (pa.phone && !/5640$/.test(pa.phone)) {
+      throw new Error('Receiver phone must be 2519****5640');
+    }
+    if (pa.amount == null || !Number.isFinite(pa.amount)) throw new Error('Receipt amount not found');
+    if (Number.isFinite(amount) && Math.abs(pa.amount - Number(amount)) > 0.05) throw new Error('Receipt amount does not match');
+    if (pa.amount > 200) throw new Error('Max deposit 200 ETB');
+    return true;
   }
   if (!/transferred\s+etb/i.test(text)) {
     throw new Error('Invalid Telebirr SMS format');
@@ -891,7 +940,9 @@ async function isAdmin(userId) {
 function extractTxnId(receipt) {
   if (!receipt) return null;
   const text = String(receipt);
-  let m = text.match(/transaction number is\s*[:\s]*([A-Za-z0-9]+)/i);
+  let m = text.match(/የሂሳብ\s*እንቅስቃሴ\s*ቁጥርዎ\s*:?\s*([A-Za-z0-9]+)/);
+  if (m) return m[1].toUpperCase();
+  m = text.match(/transaction number is\s*[:\s]*([A-Za-z0-9]+)/i);
   if (m) return m[1].toUpperCase();
   m = text.match(/txn(?:\s*id|\s*no|#)?\s*[:\s]*([A-Za-z0-9]+)/i);
   if (m) return m[1].toUpperCase();
@@ -2415,63 +2466,4 @@ if (update.action === 'settle_gw_prize') {
             chat_id: tid,
             text: '🏆 GW' + gw + ' ' + league + ' prize!\nRank #' + rank + '\n+' + prize + ' ETB added to your wallet.\nBalance: ' + newBal + ' ETB'
           });
-        } catch (e) {}
-
-        return res.status(200).json({ ok: true, balance: newBal, amount: prize, rank: rank });
-      } catch (e) {
-        console.error('settle_gw_prize', e);
-        return res.status(400).json({ ok: false, error: e.message || 'Settle failed' });
-      }
-    }
-
-if (update.action === 'redeem_promo') {
-      const initData = update.initData || '';
-      const user = verifyTelegramInitData(initData);
-      if (!user) {
-        return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
-      }
-      try {
-        const result = await redeemWalletPromoCode(user, update.code);
-        return res.status(200).json({
-          ok: true,
-          balance: result.balance,
-          amount: result.amount,
-          code: result.code,
-          message: '+' + result.amount + ' ETB credited'
-        });
-      } catch (e) {
-        console.error('redeem_promo:', e);
-        return res.status(400).json({ ok: false, error: e.message || 'Redeem failed' });
-      }
-    }
-
-    if (update.action === 'join_league') {
-      const initData = update.initData || '';
-      const user = verifyTelegramInitData(initData);
-      if (!user) {
-        return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
-      }
-      try {
-        const result = await joinLeagueServer(user, update.league, update.gameweek || 1, { amount: update.amount, promo_code: update.promo_code });
-        return res.status(200).json({
-          ok: true,
-          already: !!result.already,
-          league: result.league,
-          balance: result.balance,
-          charged: result.charged || 0,
-          message: result.already
-            ? 'Already joined this league this week.'
-            : 'Joined ' + result.league + '. ' + (result.charged || 0) + ' ETB deducted.'
-        });
-      } catch (e) {
-        console.error('join_league error:', e);
-        return res.status(400).json({ ok: false, error: e.message || 'Join failed' });
-      }
-    }
-
-    return res.status(200).json({ ok: true });
-  } catch (error) {
-    console.error('ለ Fantasy API error:', error);
-    return res.status(500).json({ ok: false, error: error.message || 'Server error' });
-  }
-};
+        } catch
