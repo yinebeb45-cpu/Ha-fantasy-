@@ -621,9 +621,25 @@ async function handleStart(msg) {
  * Works in private chat with bot (if ADMIN_USER_IDS set) or in ADMIN_CHAT_ID group.
  */
 
+// Who may publish ads from the bot: the admin group itself, ADMIN_USER_IDS, or any admin of the admin group (also in private chat)
+async function canPostAds(msg) {
+  try {
+    if (isAdminUser(msg)) return true;
+    const uid = msg && msg.from && msg.from.id;
+    if (uid && typeof isAppAdmin === 'function' && await isAppAdmin(uid)) return true;
+  } catch (e) { console.warn('canPostAds', e && e.message); }
+  // tell the person (private chat only) instead of failing silently
+  try {
+    if (msg && msg.chat && msg.chat.type === 'private') {
+      await tg('sendMessage', { chat_id: msg.chat.id, text: '⛔ You are not an admin of the admin group, so I cannot publish this.\nYour Telegram ID: ' + (msg.from && msg.from.id) + '\n(Add it to ADMIN_USER_IDS, or send it inside the admin group.)' });
+    }
+  } catch (e) {}
+  return false;
+}
+
 async function handleAdminVideo(msg) {
   const chatId = msg.chat.id;
-  if (!isAdminUser(msg)) {
+  if (!(await canPostAds(msg))) {
     return false;
   }
   const vid = msg.video || (msg.video_note ? null : null);
@@ -656,7 +672,7 @@ async function handleAdminVideo(msg) {
 
 async function handleAdminPhoto(msg) {
   const chatId = msg.chat.id;
-  if (!isAdminUser(msg)) {
+  if (!(await canPostAds(msg))) {
     // Ignore photos from normal users
     return false;
   }
@@ -742,7 +758,7 @@ async function handleBotText(msg) {
   // /post  or  /post Your custom caption here
   // /postphoto https://example.com/image.jpg Caption text
   if (lower === '/post' || lower.indexOf('/post ') === 0 || lower.indexOf('/postphoto') === 0) {
-    if (!isAdminUser(msg)) {
+    if (!(await canPostAds(msg))) {
       await tg('sendMessage', { chat_id: chatId, text: '⛔ Admin only.' });
       return true;
     }
@@ -1857,6 +1873,7 @@ module.exports = async function handler(req, res) {
         }
       } catch (e) {
         console.error('handleBot message error:', e);
+        try { if (update.message && update.message.chat) await tg('sendMessage', { chat_id: update.message.chat.id, text: '❌ Bot error: ' + String((e && e.message) || e).slice(0, 300) }); } catch (e2) {}
       }
       return res.status(200).json({ ok: true });
     }
@@ -2436,34 +2453,4 @@ if (update.action === 'settle_gw_prize') {
             return res.status(200).json({ ok: true, balance: Number(w.balance || 0), already: true });
           }
         } catch (e) {
-          console.warn('prize_settlements lookup', e.message || e);
-        }
-
-        const userName = [user.first_name, user.last_name].filter(Boolean).join(' ') || 'Manager';
-        let wallet = await getWallet(tid, userName);
-        const newBal = Number(wallet.balance || 0) + prize;
-        const { error: wErr } = await sb.from('user_wallets').update({
-          balance: newBal,
-          total_winnings: Number(wallet.total_winnings || 0) + prize
-        }).eq('telegram_id', tid);
-        if (wErr) throw wErr;
-
-        try {
-          await sb.from('prize_settlements').insert({
-            telegram_id: tid,
-            user_name: userName,
-            league: league,
-            gameweek: gw,
-            rank: rank,
-            amount: prize
-          });
-        } catch (e) {
-          console.warn('prize_settlements insert', e.message || e);
-        }
-
-        try {
-          await tg('sendMessage', {
-            chat_id: tid,
-            text: '🏆 GW' + gw + ' ' + league + ' prize!\nRank #' + rank + '\n+' + prize + ' ETB added to your wallet.\nBalance: ' + newBal + ' ETB'
-          });
-        } catch
+          console.warn('prize_settlements lookup', e.message || e
