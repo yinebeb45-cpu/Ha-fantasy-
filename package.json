@@ -1,7 +1,7 @@
-{
+m{
   "name": "le-fantasy-api",
   "version": "1.0.0",
   "private": true,
-  "engines": { "node": "24.x" },
+  "engines": { "node": "26.x" },
   "dependencies": {}
 }
