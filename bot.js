@@ -1023,6 +1023,82 @@ async function assertNoDuplicateReceipt(receipt, telegramId) {
   return { txn: txn };
 }
 
+// ---------- % promo codes + invite links (all state lives in table bot_settings: key / value) ----------
+const BOT_USERNAME_PUBLIC = 'Lefantasy1_bot';
+// The SERVER decides the entry fee (the client amount is ignored)
+const PERCENT_PROMOS = { WINWIN: { percent: 50, oncePerUser: true } };
+const REFERRALS_PER_FREE_ENTRY = 2;   // every 2 friends who join = 1 free weekly entry
+
+async function getSetting(sb, key) {
+  const r = await sb.from('bot_settings').select('value').eq('key', key).limit(1);
+  if (r.error) throw new Error(r.error.message);
+  return (r.data && r.data[0] && r.data[0].value != null) ? String(r.data[0].value) : null;
+}
+async function setSetting(sb, key, value) {
+  const r = await sb.from('bot_settings').upsert({ key: key, value: String(value) }, { onConflict: 'key' });
+  if (r.error) throw new Error(r.error.message);
+}
+async function getFreeEntries(sb, tid) {
+  try { return Math.max(0, Number(await getSetting(sb, 'free_entries_' + tid)) || 0); } catch (e) { return 0; }
+}
+function inviteLinkFor(tid) {
+  return 'https://t.me/' + BOT_USERNAME_PUBLIC + '?startapp=ref_' + String(tid);
+}
+
+// Called when a NEW person opens the app through someone's invite link
+async function registerReferral(user, refRaw) {
+  const sb = db();
+  const m = /^ref_(\d{1,15})$/.exec(String(refRaw || '').trim());
+  if (!m) return { ok: false, reason: 'bad_code' };
+  const referrer = m[1];
+  const invitee = String(user.id);
+  if (referrer === invitee) return { ok: false, reason: 'self' };
+  if (await getSetting(sb, 'ref_by_' + invitee)) return { ok: true, already: true };
+  // only people who never joined a contest can be invited
+  const ce = await sb.from('contest_entries').select('telegram_id').eq('telegram_id', invitee).limit(1);
+  if (!ce.error && ce.data && ce.data.length) return { ok: false, reason: 'existing_player' };
+  const us = await sb.from('user_squads').select('telegram_id').eq('telegram_id', invitee).eq('paid', true).limit(1);
+  if (!us.error && us.data && us.data.length) return { ok: false, reason: 'existing_player' };
+  // the inviter must be a real player
+  const rw = await sb.from('user_wallets').select('telegram_id').eq('telegram_id', referrer).limit(1);
+  if (rw.error || !rw.data || !rw.data.length) return { ok: false, reason: 'unknown_inviter' };
+  await setSetting(sb, 'ref_by_' + invitee, referrer);
+  return { ok: true };
+}
+
+// Called after an invited person joins (and pays for) their first contest
+async function qualifyReferral(sb, inviteeId, inviteeName) {
+  const referrer = await getSetting(sb, 'ref_by_' + inviteeId);
+  if (!referrer) return;
+  if (await getSetting(sb, 'ref_done_' + inviteeId)) return;
+  await setSetting(sb, 'ref_done_' + inviteeId, '1'); // mark first: a friend can never be counted twice
+  const count = (Number(await getSetting(sb, 'ref_count_' + referrer)) || 0) + 1;
+  await setSetting(sb, 'ref_count_' + referrer, count);
+  let text;
+  if (count % REFERRALS_PER_FREE_ENTRY === 0) {
+    const free = (await getFreeEntries(sb, referrer)) + 1;
+    await setSetting(sb, 'free_entries_' + referrer, free);
+    text = '🎁 ' + inviteeName + ' joined with your invite link!\n\nYou invited ' + REFERRALS_PER_FREE_ENTRY + ' friends — you earned 1 WEEK FREE ENTRY.\nIt is applied automatically the next time you join a contest. Free entries available: ' + free;
+  } else {
+    const inCycle = count % REFERRALS_PER_FREE_ENTRY;
+    text = '👥 ' + inviteeName + ' joined with your invite link! (' + inCycle + '/' + REFERRALS_PER_FREE_ENTRY + ')\nInvite ' + (REFERRALS_PER_FREE_ENTRY - inCycle) + ' more to get 1 week free entry.';
+  }
+  try { await tg('sendMessage', { chat_id: referrer, text: text }); } catch (e) {}
+}
+
+async function getReferralInfo(user) {
+  const sb = db();
+  const tid = String(user.id);
+  const count = Number(await getSetting(sb, 'ref_count_' + tid).catch(function () { return 0; })) || 0;
+  return {
+    link: inviteLinkFor(tid),
+    count: count,
+    per_reward: REFERRALS_PER_FREE_ENTRY,
+    progress: count % REFERRALS_PER_FREE_ENTRY,
+    free_entries: await getFreeEntries(sb, tid)
+  };
+}
+
 async function joinLeagueServer(user, league, gameweek, opts) {
   const sb = db();
   const lg = String(league || '').toUpperCase();
@@ -1034,8 +1110,28 @@ async function joinLeagueServer(user, league, gameweek, opts) {
   // Entry fee is decided HERE (the client amount is ignored): 100, minus the influencer-code discount if a valid code was sent
   const promo = opts.promo_code ? String(opts.promo_code).toUpperCase() : '';
   let ENTRY = 100;
-  if (promo && INFLUENCER_PROMOS[promo]) ENTRY = Math.max(0, 100 - Number(INFLUENCER_PROMOS[promo].discount || 0));
-  console.log('joinLeagueServer', tid, lg, gw, 'charge', ENTRY, 'promo', promo);
+  // 1) a referral reward (free weekly entry) comes first, 2) then a % code (WINWIN), 3) then an influencer code
+  let usedFreeEntry = false;
+  let freeLeft = await getFreeEntries(sb, tid);
+  let percentPromo = null;
+  let promoBlocked = '';
+  if (freeLeft > 0) {
+    ENTRY = 0;
+    usedFreeEntry = true;
+  } else if (promo && PERCENT_PROMOS[promo]) {
+    const pp = PERCENT_PROMOS[promo];
+    let alreadyUsed = null;
+    if (pp.oncePerUser) { try { alreadyUsed = await getSetting(sb, 'promo_used_' + promo + '_' + tid); } catch (e) {} }
+    if (alreadyUsed) {
+      promoBlocked = 'You already used promo ' + promo + ' (one use per player). Remove the code to pay the full fee.';
+    } else {
+      ENTRY = Math.max(0, Math.round(100 * (100 - pp.percent)) / 100);
+      percentPromo = promo;
+    }
+  } else if (promo && INFLUENCER_PROMOS[promo]) {
+    ENTRY = Math.max(0, 100 - Number(INFLUENCER_PROMOS[promo].discount || 0));
+  }
+  console.log('joinLeagueServer', tid, lg, gw, 'charge', ENTRY, 'promo', promo, 'free', usedFreeEntry);
 
   // Prefer dedicated contest_entries table if it exists
   let useEntriesTable = true;
@@ -1072,9 +1168,13 @@ async function joinLeagueServer(user, league, gameweek, opts) {
 
   const wallet = await getWallet(tid, userName);
   const balance = Number(wallet.balance || 0);
+  if (promoBlocked) throw new Error(promoBlocked);
   if (balance < ENTRY) {
     throw new Error('Insufficient balance. Need ' + ENTRY + ' ETB (you have ' + balance + ').');
   }
+  // use up the free entry / one-time code now (undone by refund() if the join fails)
+  if (usedFreeEntry) await setSetting(sb, 'free_entries_' + tid, Math.max(0, freeLeft - 1));
+  if (percentPromo && PERCENT_PROMOS[percentPromo].oncePerUser) await setSetting(sb, 'promo_used_' + percentPromo + '_' + tid, new Date().toISOString());
 
   const newBalance = balance - ENTRY;
   const { error: wErr } = await sb
@@ -1087,7 +1187,7 @@ async function joinLeagueServer(user, league, gameweek, opts) {
   try {
     const pcode = String((opts && opts.promo_code) || '').toUpperCase();
     const ip = INFLUENCER_PROMOS[pcode];
-    if (ip && ip.telegramId && ENTRY < 100) {
+    if (ip && ip.telegramId && ENTRY < 100 && !usedFreeEntry) {
       const infId = String(ip.telegramId).trim();
       if (infId) {
         const { data: infRows } = await sb.from('user_wallets').select('*').eq('telegram_id', infId).limit(1);
@@ -1121,6 +1221,14 @@ async function joinLeagueServer(user, league, gameweek, opts) {
 
   async function refund() {
     await sb.from('user_wallets').update({ balance: balance }).eq('telegram_id', tid);
+    try { if (usedFreeEntry) await setSetting(sb, 'free_entries_' + tid, freeLeft); } catch (e) {}
+    try { if (percentPromo) await sb.from('bot_settings').delete().eq('key', 'promo_used_' + percentPromo + '_' + tid); } catch (e) {}
+  }
+
+  async function joined() {
+    // count this join for the person who invited us (only for paid entries)
+    try { if (ENTRY > 0) await qualifyReferral(sb, tid, userName); } catch (e) { console.warn('qualifyReferral', e.message || e); }
+    return { already: false, league: lg, balance: newBalance, charged: ENTRY, free_entry: usedFreeEntry, promo: percentPromo };
   }
 
   // 1) contest_entries (preferred)
@@ -1148,7 +1256,7 @@ async function joinLeagueServer(user, league, gameweek, opts) {
       } catch (e) {
         console.warn('mark user_squads paid after contest_entries:', e.message || e);
       }
-      return { already: false, league: lg, balance: newBalance, charged: ENTRY };
+      return await joined();
     }
   }
 
@@ -1160,7 +1268,7 @@ async function joinLeagueServer(user, league, gameweek, opts) {
     throw e;
   }
 
-  return { already: false, league: lg, balance: newBalance, charged: ENTRY };
+  return await joined();
 }
 
 async function markUserSquadPaid(sb, tid, userName, lg, gw, existing) {
@@ -1470,8 +1578,9 @@ async function rejectRequest(requestId) {
 }
 
 // ---- Admin-group money summary: approved / declined deposits & withdrawals ----
-async function getWalletStats() {
+async function getWalletStats(opts) {
   const sb = db();
+  const sinceMs = (opts && Number(opts.since) > 0) ? Number(opts.since) : 0;
   let rows = [];
   for (let from = 0; from < 50000; from += 1000) {
     const { data, error } = await sb.from('wallet_requests').select('*').range(from, from + 999);
@@ -1482,6 +1591,7 @@ async function getWalletStats() {
   const blank = function () { return { approved: { n: 0, sum: 0 }, rejected: { n: 0, sum: 0 }, pending: { n: 0, sum: 0 } }; };
   const all = { deposit: blank(), withdrawal: blank() };
   const today = { deposit: blank(), withdrawal: blank() };
+  const period = { deposit: blank(), withdrawal: blank() };
   // "today" = calendar day in Addis Ababa (UTC+3)
   const dayKey = function (d) { return new Date(new Date(d).getTime() + 3 * 3600 * 1000).toISOString().slice(0, 10); };
   const todayKey = dayKey(Date.now());
@@ -1495,8 +1605,9 @@ async function getWalletStats() {
     all[t][bucket].n++; all[t][bucket].sum += amt;
     const when = r.processed_at || r.created_at;
     if (when && dayKey(when) === todayKey) { today[t][bucket].n++; today[t][bucket].sum += amt; }
+    if (sinceMs && when && new Date(when).getTime() >= sinceMs) { period[t][bucket].n++; period[t][bucket].sum += amt; }
   });
-  return { all: all, today: today };
+  return { all: all, today: today, period: period };
 }
 
 function formatWalletStats(st) {
@@ -1515,6 +1626,49 @@ function formatWalletStats(st) {
   const net = st.all.deposit.approved.sum - st.all.withdrawal.approved.sum;
   return '📊 WALLET SUMMARY\n\n' + block('📅 TODAY', st.today) + '\n\n' + block('🧾 ALL TIME', st.all) +
     '\n\n📈 Net (approved deposits − paid withdrawals): ' + (Math.round(net * 100) / 100) + ' ETB';
+}
+
+// Money report sent to the admin group once, right after a gameweek is paid out.
+async function sendGwMoneyReport(info) {
+  try {
+    const sb = db();
+    const key = 'gw_report_sent_' + info.gameweek;
+    let already = null;
+    try { already = await getSetting(sb, key); } catch (e) {}
+    if (already) return;
+    // Period = since the previous report (so reports tile with no gaps/overlap); first ever = since the previous GW deadline
+    let since = 0;
+    try { since = Date.parse(await getSetting(sb, 'last_gw_report_at')) || 0; } catch (e) {}
+    if (!since && info.prevDeadline) since = Date.parse(info.prevDeadline) || 0;
+    if (!since) since = Date.now() - 7 * 24 * 3600 * 1000;
+    const st = await getWalletStats({ since: since });
+    const f = function (x) { return x.n + ' req = ' + (Math.round(x.sum * 100) / 100) + ' ETB'; };
+    const r2 = function (v) { return Math.round(v * 100) / 100; };
+    const house = r2(info.totalCollected - info.playerPool);
+    const fmtDate = function (ms) { return new Date(ms + 3 * 3600 * 1000).toISOString().slice(0, 16).replace('T', ' '); };
+    const text =
+      '🏁 GW' + info.gameweek + ' FINISHED — MONEY REPORT\n\n' +
+      '👥 Managers who joined: ' + info.managers + '\n' +
+      '💵 Entries (' + info.managers + ' × 100 ETB): ' + r2(info.totalCollected) + ' ETB\n' +
+      '🏆 Prize pool (75%): ' + r2(info.playerPool) + ' ETB\n' +
+      '🏦 House share (25%): ' + house + ' ETB\n' +
+      '✅ Prizes paid now: ' + info.paidOut + ' winner(s) = ' + r2(info.paidSum) + ' ETB' +
+      (info.alreadyPaid ? '\n↩️ Already paid before: ' + info.alreadyPaid + ' winner(s)' : '') + '\n\n' +
+      '📅 Wallet activity since ' + fmtDate(since) + ' (EAT)\n' +
+      '💰 DEPOSITS\n' +
+      '  ✅ Approved: ' + f(st.period.deposit.approved) + '\n' +
+      '  ❌ Declined: ' + f(st.period.deposit.rejected) + '\n' +
+      '💸 WITHDRAWALS\n' +
+      '  ✅ Paid: ' + f(st.period.withdrawal.approved) + '\n' +
+      '  ❌ Declined: ' + f(st.period.withdrawal.rejected) + '\n\n' +
+      '📈 Net (approved deposits − paid withdrawals): ' + r2(st.period.deposit.approved.sum - st.period.withdrawal.approved.sum) + ' ETB\n' +
+      'ℹ️ Entries are counted at 100 ETB each; promo/free entries are not deducted.';
+    const sent = await tg('sendMessage', { chat_id: ADMIN_CHAT_ID, text: text });
+    if (sent && sent.ok) {
+      try { await setSetting(sb, key, new Date().toISOString()); } catch (e) {}
+      try { await setSetting(sb, 'last_gw_report_at', new Date().toISOString()); } catch (e) {}
+    }
+  } catch (e) { console.warn('gw money report failed', e && e.message); }
 }
 
 async function sendWalletStatsToAdmin() {
@@ -1700,7 +1854,7 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({
         ok: true,
         service: 'le-fantasy-telegram',
-        version: 'v7-ads-fix',
+        version: 'v8-gw-report',
         admin_chat: ADMIN_CHAT_ID,
         bot: BOT_TOKEN ? 'token_set' : 'token_missing',
         supabase: (SUPABASE_URL && SUPABASE_SERVICE_KEY) ? 'env_set' : 'env_missing',
@@ -2289,265 +2443,4 @@ module.exports = async function handler(req, res) {
             return livePts[eid] != null ? livePts[eid] : 0;
           };
           const form = FORMS[m.formation] || FORMS['4-3-3'];
-          const byPos = function (k) { return players.filter(function (p) { return posOf(p) === k; }); };
-          let xi = [].concat(byPos('GKP').slice(0, 1), byPos('DEF').slice(0, form.def), byPos('MID').slice(0, form.mid), byPos('FWD').slice(0, form.fwd));
-          let bench;
-          if (xi.length === 11) bench = players.filter(function (p) { return xi.indexOf(p) < 0; });
-          else { xi = players.slice(0, 11); bench = players.slice(11); }
-          const chip = chipOf(m.active_chip);
-          const mult = chip === 'TC' ? 3 : 2;
-          let total = 0;
-          xi.forEach(function (p) {
-            let pts = ptsOf(p);
-            if (m.captain_id != null && String(p.id) === String(m.captain_id)) pts = pts * mult;
-            total += pts;
-          });
-          if (chip === 'BB') bench.forEach(function (p) { total += ptsOf(p); });
-          m._final = total;
-          m._chip = chip;
-          m._unmatched = unmatched;
-          m._empty = players.length === 0;
-        });
-
-        // Same rule as the leaderboard: no saved squad = not ranked, no prize
-        rows = rows.filter(function (m) { return !m._empty; });
-
-        // Ranking: points, then earlier entry, then name (same tie-break as the leaderboard)
-        rows.sort(function (a, b) {
-          if (b._final !== a._final) return b._final - a._final;
-          const ta = Date.parse(a.joined_at || a.created_at || 0) || 0;
-          const tb = Date.parse(b.joined_at || b.created_at || 0) || 0;
-          if (ta && tb && ta !== tb) return ta - tb;
-          const na = String(a.user_name || '').toLowerCase(), nb = String(b.user_name || '').toLowerCase();
-          return na < nb ? -1 : (na > nb ? 1 : 0);
-        });
-
-        const n = rows.length;
-        const totalCollected = n * entry;
-        const playerPool = Math.round(totalCollected * 0.75);
-        // prize distribution same spirit as client: top heavy + last 2 min 100
-        const prizes = new Array(n).fill(0);
-        if (n > 0) {
-          let lastCount = n >= 12 ? 2 : (n === 11 ? 1 : 0);
-          let lastEach = lastCount ? Math.max(100, Math.round(playerPool * 0.035)) : 0;
-          let lastTotal = lastEach * lastCount;
-          let remaining = Math.max(0, playerPool - lastTotal);
-          const topN = n - lastCount;
-          let weights = [];
-          for (let i = 0; i < topN; i++) {
-            weights.push(Math.max(1, topN - i));
-          }
-          if (weights.length > 0) weights[0] *= 3;
-          if (weights.length > 1) weights[1] *= 2;
-          const wsum = weights.reduce(function (a, b) { return a + b; }, 0) || 1;
-          for (let i = 0; i < topN; i++) {
-            prizes[i] = Math.round(remaining * (weights[i] / wsum));
-          }
-          for (let i = 0; i < lastCount; i++) {
-            prizes[n - lastCount + i] = lastEach;
-          }
-          const sumP = prizes.reduce(function (a, b) { return a + b; }, 0);
-          if (sumP !== playerPool && prizes.length) prizes[0] += (playerPool - sumP);
-        }
-
-        // Already settled? (if this lookup fails we STOP rather than risk paying twice)
-        const ps = await sb.from('prize_settlements').select('telegram_id').eq('league', league).eq('gameweek', gw).limit(5000);
-        if (ps.error) throw new Error('prize_settlements lookup failed: ' + (ps.error.message || ps.error));
-        const settled = {};
-        (ps.data || []).forEach(function (r) { settled[String(r.telegram_id)] = true; });
-
-        const unmatchedManagers = rows.filter(function (m) { return m._unmatched > 0; }).length;
-        const ranking = rows.map(function (m, i) {
-          return {
-            rank: i + 1, telegram_id: String(m.telegram_id), user_name: m.user_name || 'Manager',
-            points: m._final, chip: m._chip || 'none', formation: m.formation || '4-3-3',
-            unmatched_players: m._unmatched, no_squad: m._empty, prize: prizes[i] || 0,
-            already_paid: !!settled[String(m.telegram_id)]
-          };
-        });
-        const summary = {
-          league: league, gameweek: gw, fpl_finished: !!ev.finished, fpl_data_checked: !!ev.data_checked,
-          managers: n, totalCollected: totalCollected, playerPool: playerPool,
-          unmatched_managers: unmatchedManagers, already_paid: ranking.filter(function (r) { return r.already_paid; }).length
-        };
-
-        if (!confirm) {
-          return res.status(200).json({ ok: true, dryRun: true, paid: false, summary: summary, ranking: ranking });
-        }
-
-        // ---- REAL PAYOUT: safety checks ----
-        if (!n) return res.status(409).json({ ok: false, error: 'No joined managers for this gameweek', summary: summary });
-        if (!ev.finished) return res.status(409).json({ ok: false, error: 'FPL has not marked GW' + gw + ' as finished yet', summary: summary });
-        if (unmatchedManagers > 0 && update.allowUnmatched !== true) {
-          return res.status(409).json({ ok: false, error: unmatchedManagers + ' manager(s) have players that could not be matched to FPL. Run the dry run, review, or pass allowUnmatched:true.', summary: summary });
-        }
-
-        let paidOut = 0;
-        let skipped = 0;
-        for (let i = 0; i < rows.length; i++) {
-          const m = rows[i];
-          const tid = String(m.telegram_id);
-          const prize = Number(prizes[i] || 0);
-          if (prize <= 0 || settled[tid]) { skipped++; continue; }
-          const userName = m.user_name || 'Manager';
-          // 1) record first (prevents double pay on re-run); 2) credit wallet; if crediting fails, undo the record and stop
-          const ins = await sb.from('prize_settlements').insert({
-            telegram_id: tid, user_name: userName, league: league, gameweek: gw, rank: i + 1, amount: prize
-          });
-          if (ins && ins.error) {
-            return res.status(500).json({ ok: false, error: 'Could not record settlement for ' + tid + ': ' + (ins.error.message || ins.error), paidOut: paidOut, stoppedAtRank: i + 1 });
-          }
-          let newBal;
-          try {
-            const wallet = await getWallet(tid, userName);
-            newBal = Number(wallet.balance || 0) + prize;
-            const up = await sb.from('user_wallets').update({
-              balance: newBal,
-              total_winnings: Number(wallet.total_winnings || 0) + prize
-            }).eq('telegram_id', tid);
-            if (up && up.error) throw new Error(up.error.message || String(up.error));
-          } catch (e) {
-            try { await sb.from('prize_settlements').delete().eq('telegram_id', tid).eq('league', league).eq('gameweek', gw); } catch (e2) {}
-            return res.status(500).json({ ok: false, error: 'Wallet credit failed for ' + tid + ': ' + (e.message || e), paidOut: paidOut, stoppedAtRank: i + 1 });
-          }
-          try {
-            await tg('sendMessage', {
-              chat_id: tid,
-              text: '🏆 GW' + gw + ' finished!\nYour rank: #' + (i + 1) + '\nPrize: +' + prize + ' ETB\nNew balance: ' + newBal + ' ETB'
-            });
-          } catch (e) {}
-          paidOut++;
-        }
-
-        return res.status(200).json({ ok: true, dryRun: false, paid: true, paidOut: paidOut, skipped: skipped, summary: summary });
-      } catch (e) {
-        console.error('settle_gw_all', e);
-        return res.status(500).json({ ok: false, error: e.message || 'settle failed' });
-      }
-    }
-
-if (update.action === 'settle_gw_prize') {
-      // Prize amount comes from the caller, so this is ADMIN ONLY (users must never set their own prize)
-      if (!adminAuthorized(update, req)) return res.status(401).json({ ok: false, error: 'Admin secret required' });
-      if (update.confirm !== true && update.confirm !== 'true') {
-        return res.status(200).json({ ok: false, error: 'Settlement disabled until GW fully ends. Pass confirm:true.' });
-      }
-      const initData = update.initData || '';
-      const user = verifyTelegramInitData(initData);
-      if (!user) {
-        return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
-      }
-      try {
-        const league = String(update.league || 'EPL').toUpperCase();
-        const gw = Number(update.gameweek || 1);
-        const prize = Math.max(0, Math.round(Number(update.prize || 0)));
-        const rank = Number(update.rank || 0);
-        const tid = String(user.id);
-        if (prize <= 0) {
-          return res.status(200).json({ ok: true, balance: null, skipped: true, message: 'No prize for this rank' });
-        }
-        const sb = db();
-        // Idempotent: prize_settlements table or unique key in wallet_requests note
-        try {
-          const { data: existing } = await sb
-            .from('prize_settlements')
-            .select('id')
-            .eq('telegram_id', tid)
-            .eq('league', league)
-            .eq('gameweek', gw)
-            .maybeSingle();
-          if (existing) {
-            const w = await getWallet(tid, [user.first_name, user.last_name].filter(Boolean).join(' ') || 'Manager');
-            return res.status(200).json({ ok: true, balance: Number(w.balance || 0), already: true });
-          }
-        } catch (e) {
-          console.warn('prize_settlements lookup', e.message || e);
-        }
-
-        const userName = [user.first_name, user.last_name].filter(Boolean).join(' ') || 'Manager';
-        let wallet = await getWallet(tid, userName);
-        const newBal = Number(wallet.balance || 0) + prize;
-        const { error: wErr } = await sb.from('user_wallets').update({
-          balance: newBal,
-          total_winnings: Number(wallet.total_winnings || 0) + prize
-        }).eq('telegram_id', tid);
-        if (wErr) throw wErr;
-
-        try {
-          await sb.from('prize_settlements').insert({
-            telegram_id: tid,
-            user_name: userName,
-            league: league,
-            gameweek: gw,
-            rank: rank,
-            amount: prize
-          });
-        } catch (e) {
-          console.warn('prize_settlements insert', e.message || e);
-        }
-
-        try {
-          await tg('sendMessage', {
-            chat_id: tid,
-            text: '🏆 GW' + gw + ' ' + league + ' prize!\nRank #' + rank + '\n+' + prize + ' ETB added to your wallet.\nBalance: ' + newBal + ' ETB'
-          });
-        } catch (e) {}
-
-        return res.status(200).json({ ok: true, balance: newBal, amount: prize, rank: rank });
-      } catch (e) {
-        console.error('settle_gw_prize', e);
-        return res.status(400).json({ ok: false, error: e.message || 'Settle failed' });
-      }
-    }
-
-if (update.action === 'redeem_promo') {
-      const initData = update.initData || '';
-      const user = verifyTelegramInitData(initData);
-      if (!user) {
-        return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
-      }
-      try {
-        const result = await redeemWalletPromoCode(user, update.code);
-        return res.status(200).json({
-          ok: true,
-          balance: result.balance,
-          amount: result.amount,
-          code: result.code,
-          message: '+' + result.amount + ' ETB credited'
-        });
-      } catch (e) {
-        console.error('redeem_promo:', e);
-        return res.status(400).json({ ok: false, error: e.message || 'Redeem failed' });
-      }
-    }
-
-    if (update.action === 'join_league') {
-      const initData = update.initData || '';
-      const user = verifyTelegramInitData(initData);
-      if (!user) {
-        return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
-      }
-      try {
-        const result = await joinLeagueServer(user, update.league, update.gameweek || 1, { amount: update.amount, promo_code: update.promo_code });
-        return res.status(200).json({
-          ok: true,
-          already: !!result.already,
-          league: result.league,
-          balance: result.balance,
-          charged: result.charged || 0,
-          message: result.already
-            ? 'Already joined this league this week.'
-            : 'Joined ' + result.league + '. ' + (result.charged || 0) + ' ETB deducted.'
-        });
-      } catch (e) {
-        console.error('join_league error:', e);
-        return res.status(400).json({ ok: false, error: e.message || 'Join failed' });
-      }
-    }
-
-    return res.status(200).json({ ok: true });
-  } catch (error) {
-    console.error('ለ Fantasy API error:', error);
-    return res.status(500).json({ ok: false, error: error.message || 'Server error' });
-  }
-};
+          const byPos = function (k) { return players.filter(function (p) { return posOf(p) 
