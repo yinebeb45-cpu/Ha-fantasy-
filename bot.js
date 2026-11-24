@@ -2465,4 +2465,204 @@ module.exports = async function handler(req, res) {
           if (leftover !== 0 && topN > 0) prizes[0] += leftover;
         }
 
-        // Already settled? (if this lookup fails we STOP rather than risk paying tw
+                // Already settled? (if this lookup fails we STOP rather than risk paying twice)
+        const ps = await sb.from('prize_settlements').select('telegram_id').eq('league', league).eq('gameweek', gw).limit(5000);
+        if (ps.error) throw new Error('prize_settlements lookup failed: ' + (ps.error.message || ps.error));
+        const settled = {};
+        (ps.data || []).forEach(function (r) { settled[String(r.telegram_id)] = true; });
+
+        const unmatchedManagers = rows.filter(function (m) { return m._unmatched > 0; }).length;
+        const ranking = rows.map(function (m, i) {
+          return {
+            rank: i + 1, telegram_id: String(m.telegram_id), user_name: m.user_name || 'Manager',
+            points: m._final, chip: m._chip || 'none', formation: m.formation || '4-3-3',
+            unmatched_players: m._unmatched, no_squad: m._empty, prize: prizes[i] || 0,
+            already_paid: !!settled[String(m.telegram_id)]
+          };
+        });
+        const summary = {
+          league: league, gameweek: gw, fpl_finished: !!ev.finished, fpl_data_checked: !!ev.data_checked,
+          managers: n, totalCollected: totalCollected, playerPool: playerPool,
+          unmatched_managers: unmatchedManagers, already_paid: ranking.filter(function (r) { return r.already_paid; }).length
+        };
+
+        if (!confirm) {
+          return res.status(200).json({ ok: true, dryRun: true, paid: false, summary: summary, ranking: ranking });
+        }
+
+        // ---- REAL PAYOUT: safety checks ----
+        if (!n) return res.status(409).json({ ok: false, error: 'No joined managers for this gameweek', summary: summary });
+        if (!ev.finished) return res.status(409).json({ ok: false, error: 'FPL has not marked GW' + gw + ' as finished yet', summary: summary });
+        if (unmatchedManagers > 0 && update.allowUnmatched !== true) {
+          return res.status(409).json({ ok: false, error: unmatchedManagers + ' manager(s) have players that could not be matched to FPL. Run the dry run, review, or pass allowUnmatched:true.', summary: summary });
+        }
+
+        let paidOut = 0;
+        let skipped = 0;
+        for (let i = 0; i < rows.length; i++) {
+          const m = rows[i];
+          const tid = String(m.telegram_id);
+          const prize = Number(prizes[i] || 0);
+          if (prize <= 0 || settled[tid]) { skipped++; continue; }
+          const userName = m.user_name || 'Manager';
+          // 1) record first (prevents double pay on re-run); 2) credit wallet; if crediting fails, undo the record and stop
+          const ins = await sb.from('prize_settlements').insert({
+            telegram_id: tid, user_name: userName, league: league, gameweek: gw, rank: i + 1, amount: prize
+          });
+          if (ins && ins.error) {
+            return res.status(500).json({ ok: false, error: 'Could not record settlement for ' + tid + ': ' + (ins.error.message || ins.error), paidOut: paidOut, stoppedAtRank: i + 1 });
+          }
+          let newBal;
+          try {
+            const wallet = await getWallet(tid, userName);
+            newBal = Number(wallet.balance || 0) + prize;
+            const up = await sb.from('user_wallets').update({
+              balance: newBal,
+              total_winnings: Number(wallet.total_winnings || 0) + prize
+            }).eq('telegram_id', tid);
+            if (up && up.error) throw new Error(up.error.message || String(up.error));
+          } catch (e) {
+            try { await sb.from('prize_settlements').delete().eq('telegram_id', tid).eq('league', league).eq('gameweek', gw); } catch (e2) {}
+            return res.status(500).json({ ok: false, error: 'Wallet credit failed for ' + tid + ': ' + (e.message || e), paidOut: paidOut, stoppedAtRank: i + 1 });
+          }
+          try {
+            await tg('sendMessage', {
+              chat_id: tid,
+              text: '🏆 GW' + gw + ' finished!\nYour rank: #' + (i + 1) + '\nPrize: +' + prize + ' ETB\nNew balance: ' + newBal + ' ETB'
+            });
+          } catch (e) {}
+          paidOut++;
+        }
+
+        return res.status(200).json({ ok: true, dryRun: false, paid: true, paidOut: paidOut, skipped: skipped, summary: summary });
+      } catch (e) {
+        console.error('settle_gw_all', e);
+        return res.status(500).json({ ok: false, error: e.message || 'settle failed' });
+      }
+    }
+
+if (update.action === 'settle_gw_prize') {
+      // Prize amount comes from the caller, so this is ADMIN ONLY (users must never set their own prize)
+      if (!adminAuthorized(update, req)) return res.status(401).json({ ok: false, error: 'Admin secret required' });
+      if (update.confirm !== true && update.confirm !== 'true') {
+        return res.status(200).json({ ok: false, error: 'Settlement disabled until GW fully ends. Pass confirm:true.' });
+      }
+      const initData = update.initData || '';
+      const user = verifyTelegramInitData(initData);
+      if (!user) {
+        return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
+      }
+      try {
+        const league = String(update.league || 'EPL').toUpperCase();
+        const gw = Number(update.gameweek || 1);
+        const prize = Math.max(0, Math.round(Number(update.prize || 0)));
+        const rank = Number(update.rank || 0);
+        const tid = String(user.id);
+        if (prize <= 0) {
+          return res.status(200).json({ ok: true, balance: null, skipped: true, message: 'No prize for this rank' });
+        }
+        const sb = db();
+        // Idempotent: prize_settlements table or unique key in wallet_requests note
+        try {
+          const { data: existing } = await sb
+            .from('prize_settlements')
+            .select('id')
+            .eq('telegram_id', tid)
+            .eq('league', league)
+            .eq('gameweek', gw)
+            .maybeSingle();
+          if (existing) {
+            const w = await getWallet(tid, [user.first_name, user.last_name].filter(Boolean).join(' ') || 'Manager');
+            return res.status(200).json({ ok: true, balance: Number(w.balance || 0), already: true });
+          }
+        } catch (e) {
+          console.warn('prize_settlements lookup', e.message || e);
+        }
+
+        const userName = [user.first_name, user.last_name].filter(Boolean).join(' ') || 'Manager';
+        let wallet = await getWallet(tid, userName);
+        const newBal = Number(wallet.balance || 0) + prize;
+        const { error: wErr } = await sb.from('user_wallets').update({
+          balance: newBal,
+          total_winnings: Number(wallet.total_winnings || 0) + prize
+        }).eq('telegram_id', tid);
+        if (wErr) throw wErr;
+
+        try {
+          await sb.from('prize_settlements').insert({
+            telegram_id: tid,
+            user_name: userName,
+            league: league,
+            gameweek: gw,
+            rank: rank,
+            amount: prize
+          });
+        } catch (e) {
+          console.warn('prize_settlements insert', e.message || e);
+        }
+
+        try {
+          await tg('sendMessage', {
+            chat_id: tid,
+            text: '🏆 GW' + gw + ' ' + league + ' prize!\nRank #' + rank + '\n+' + prize + ' ETB added to your wallet.\nBalance: ' + newBal + ' ETB'
+          });
+        } catch (e) {}
+
+        return res.status(200).json({ ok: true, balance: newBal, amount: prize, rank: rank });
+      } catch (e) {
+        console.error('settle_gw_prize', e);
+        return res.status(400).json({ ok: false, error: e.message || 'Settle failed' });
+      }
+    }
+
+if (update.action === 'redeem_promo') {
+      const initData = update.initData || '';
+      const user = verifyTelegramInitData(initData);
+      if (!user) {
+        return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
+      }
+      try {
+        const result = await redeemWalletPromoCode(user, update.code);
+        return res.status(200).json({
+          ok: true,
+          balance: result.balance,
+          amount: result.amount,
+          code: result.code,
+          message: '+' + result.amount + ' ETB credited'
+        });
+      } catch (e) {
+        console.error('redeem_promo:', e);
+        return res.status(400).json({ ok: false, error: e.message || 'Redeem failed' });
+      }
+    }
+
+    if (update.action === 'join_league') {
+      const initData = update.initData || '';
+      const user = verifyTelegramInitData(initData);
+      if (!user) {
+        return res.status(401).json({ ok: false, error: 'Invalid Telegram authentication' });
+      }
+      try {
+        const result = await joinLeagueServer(user, update.league, update.gameweek || 1, { amount: update.amount, promo_code: update.promo_code });
+        return res.status(200).json({
+          ok: true,
+          already: !!result.already,
+          league: result.league,
+          balance: result.balance,
+          charged: result.charged || 0,
+          message: result.already
+            ? 'Already joined this league this week.'
+            : 'Joined ' + result.league + '. ' + (result.charged || 0) + ' ETB deducted.'
+        });
+      } catch (e) {
+        console.error('join_league error:', e);
+        return res.status(400).json({ ok: false, error: e.message || 'Join failed' });
+      }
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (error) {
+    console.error('ለ Fantasy API error:', error);
+    return res.status(500).json({ ok: false, error: error.message || 'Server error' });
+  }
+};
