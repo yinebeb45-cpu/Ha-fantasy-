@@ -1023,82 +1023,6 @@ async function assertNoDuplicateReceipt(receipt, telegramId) {
   return { txn: txn };
 }
 
-// ---------- % promo codes + invite links (all state lives in table bot_settings: key / value) ----------
-const BOT_USERNAME_PUBLIC = 'Lefantasy1_bot';
-// The SERVER decides the entry fee (the client amount is ignored)
-const PERCENT_PROMOS = { WINWIN: { percent: 50, oncePerUser: true } };
-const REFERRALS_PER_FREE_ENTRY = 2;   // every 2 friends who join = 1 free weekly entry
-
-async function getSetting(sb, key) {
-  const r = await sb.from('bot_settings').select('value').eq('key', key).limit(1);
-  if (r.error) throw new Error(r.error.message);
-  return (r.data && r.data[0] && r.data[0].value != null) ? String(r.data[0].value) : null;
-}
-async function setSetting(sb, key, value) {
-  const r = await sb.from('bot_settings').upsert({ key: key, value: String(value) }, { onConflict: 'key' });
-  if (r.error) throw new Error(r.error.message);
-}
-async function getFreeEntries(sb, tid) {
-  try { return Math.max(0, Number(await getSetting(sb, 'free_entries_' + tid)) || 0); } catch (e) { return 0; }
-}
-function inviteLinkFor(tid) {
-  return 'https://t.me/' + BOT_USERNAME_PUBLIC + '?startapp=ref_' + String(tid);
-}
-
-// Called when a NEW person opens the app through someone's invite link
-async function registerReferral(user, refRaw) {
-  const sb = db();
-  const m = /^ref_(\d{1,15})$/.exec(String(refRaw || '').trim());
-  if (!m) return { ok: false, reason: 'bad_code' };
-  const referrer = m[1];
-  const invitee = String(user.id);
-  if (referrer === invitee) return { ok: false, reason: 'self' };
-  if (await getSetting(sb, 'ref_by_' + invitee)) return { ok: true, already: true };
-  // only people who never joined a contest can be invited
-  const ce = await sb.from('contest_entries').select('telegram_id').eq('telegram_id', invitee).limit(1);
-  if (!ce.error && ce.data && ce.data.length) return { ok: false, reason: 'existing_player' };
-  const us = await sb.from('user_squads').select('telegram_id').eq('telegram_id', invitee).eq('paid', true).limit(1);
-  if (!us.error && us.data && us.data.length) return { ok: false, reason: 'existing_player' };
-  // the inviter must be a real player
-  const rw = await sb.from('user_wallets').select('telegram_id').eq('telegram_id', referrer).limit(1);
-  if (rw.error || !rw.data || !rw.data.length) return { ok: false, reason: 'unknown_inviter' };
-  await setSetting(sb, 'ref_by_' + invitee, referrer);
-  return { ok: true };
-}
-
-// Called after an invited person joins (and pays for) their first contest
-async function qualifyReferral(sb, inviteeId, inviteeName) {
-  const referrer = await getSetting(sb, 'ref_by_' + inviteeId);
-  if (!referrer) return;
-  if (await getSetting(sb, 'ref_done_' + inviteeId)) return;
-  await setSetting(sb, 'ref_done_' + inviteeId, '1'); // mark first: a friend can never be counted twice
-  const count = (Number(await getSetting(sb, 'ref_count_' + referrer)) || 0) + 1;
-  await setSetting(sb, 'ref_count_' + referrer, count);
-  let text;
-  if (count % REFERRALS_PER_FREE_ENTRY === 0) {
-    const free = (await getFreeEntries(sb, referrer)) + 1;
-    await setSetting(sb, 'free_entries_' + referrer, free);
-    text = '🎁 ' + inviteeName + ' joined with your invite link!\n\nYou invited ' + REFERRALS_PER_FREE_ENTRY + ' friends — you earned 1 WEEK FREE ENTRY.\nIt is applied automatically the next time you join a contest. Free entries available: ' + free;
-  } else {
-    const inCycle = count % REFERRALS_PER_FREE_ENTRY;
-    text = '👥 ' + inviteeName + ' joined with your invite link! (' + inCycle + '/' + REFERRALS_PER_FREE_ENTRY + ')\nInvite ' + (REFERRALS_PER_FREE_ENTRY - inCycle) + ' more to get 1 week free entry.';
-  }
-  try { await tg('sendMessage', { chat_id: referrer, text: text }); } catch (e) {}
-}
-
-async function getReferralInfo(user) {
-  const sb = db();
-  const tid = String(user.id);
-  const count = Number(await getSetting(sb, 'ref_count_' + tid).catch(function () { return 0; })) || 0;
-  return {
-    link: inviteLinkFor(tid),
-    count: count,
-    per_reward: REFERRALS_PER_FREE_ENTRY,
-    progress: count % REFERRALS_PER_FREE_ENTRY,
-    free_entries: await getFreeEntries(sb, tid)
-  };
-}
-
 async function joinLeagueServer(user, league, gameweek, opts) {
   const sb = db();
   const lg = String(league || '').toUpperCase();
@@ -1110,28 +1034,8 @@ async function joinLeagueServer(user, league, gameweek, opts) {
   // Entry fee is decided HERE (the client amount is ignored): 100, minus the influencer-code discount if a valid code was sent
   const promo = opts.promo_code ? String(opts.promo_code).toUpperCase() : '';
   let ENTRY = 100;
-  // 1) a referral reward (free weekly entry) comes first, 2) then a % code (WINWIN), 3) then an influencer code
-  let usedFreeEntry = false;
-  let freeLeft = await getFreeEntries(sb, tid);
-  let percentPromo = null;
-  let promoBlocked = '';
-  if (freeLeft > 0) {
-    ENTRY = 0;
-    usedFreeEntry = true;
-  } else if (promo && PERCENT_PROMOS[promo]) {
-    const pp = PERCENT_PROMOS[promo];
-    let alreadyUsed = null;
-    if (pp.oncePerUser) { try { alreadyUsed = await getSetting(sb, 'promo_used_' + promo + '_' + tid); } catch (e) {} }
-    if (alreadyUsed) {
-      promoBlocked = 'You already used promo ' + promo + ' (one use per player). Remove the code to pay the full fee.';
-    } else {
-      ENTRY = Math.max(0, Math.round(100 * (100 - pp.percent)) / 100);
-      percentPromo = promo;
-    }
-  } else if (promo && INFLUENCER_PROMOS[promo]) {
-    ENTRY = Math.max(0, 100 - Number(INFLUENCER_PROMOS[promo].discount || 0));
-  }
-  console.log('joinLeagueServer', tid, lg, gw, 'charge', ENTRY, 'promo', promo, 'free', usedFreeEntry);
+  if (promo && INFLUENCER_PROMOS[promo]) ENTRY = Math.max(0, 100 - Number(INFLUENCER_PROMOS[promo].discount || 0));
+  console.log('joinLeagueServer', tid, lg, gw, 'charge', ENTRY, 'promo', promo);
 
   // Prefer dedicated contest_entries table if it exists
   let useEntriesTable = true;
@@ -1168,13 +1072,9 @@ async function joinLeagueServer(user, league, gameweek, opts) {
 
   const wallet = await getWallet(tid, userName);
   const balance = Number(wallet.balance || 0);
-  if (promoBlocked) throw new Error(promoBlocked);
   if (balance < ENTRY) {
     throw new Error('Insufficient balance. Need ' + ENTRY + ' ETB (you have ' + balance + ').');
   }
-  // use up the free entry / one-time code now (undone by refund() if the join fails)
-  if (usedFreeEntry) await setSetting(sb, 'free_entries_' + tid, Math.max(0, freeLeft - 1));
-  if (percentPromo && PERCENT_PROMOS[percentPromo].oncePerUser) await setSetting(sb, 'promo_used_' + percentPromo + '_' + tid, new Date().toISOString());
 
   const newBalance = balance - ENTRY;
   const { error: wErr } = await sb
@@ -1187,7 +1087,7 @@ async function joinLeagueServer(user, league, gameweek, opts) {
   try {
     const pcode = String((opts && opts.promo_code) || '').toUpperCase();
     const ip = INFLUENCER_PROMOS[pcode];
-    if (ip && ip.telegramId && ENTRY < 100 && !usedFreeEntry) {
+    if (ip && ip.telegramId && ENTRY < 100) {
       const infId = String(ip.telegramId).trim();
       if (infId) {
         const { data: infRows } = await sb.from('user_wallets').select('*').eq('telegram_id', infId).limit(1);
@@ -1221,14 +1121,6 @@ async function joinLeagueServer(user, league, gameweek, opts) {
 
   async function refund() {
     await sb.from('user_wallets').update({ balance: balance }).eq('telegram_id', tid);
-    try { if (usedFreeEntry) await setSetting(sb, 'free_entries_' + tid, freeLeft); } catch (e) {}
-    try { if (percentPromo) await sb.from('bot_settings').delete().eq('key', 'promo_used_' + percentPromo + '_' + tid); } catch (e) {}
-  }
-
-  async function joined() {
-    // count this join for the person who invited us (only for paid entries)
-    try { if (ENTRY > 0) await qualifyReferral(sb, tid, userName); } catch (e) { console.warn('qualifyReferral', e.message || e); }
-    return { already: false, league: lg, balance: newBalance, charged: ENTRY, free_entry: usedFreeEntry, promo: percentPromo };
   }
 
   // 1) contest_entries (preferred)
@@ -1256,7 +1148,7 @@ async function joinLeagueServer(user, league, gameweek, opts) {
       } catch (e) {
         console.warn('mark user_squads paid after contest_entries:', e.message || e);
       }
-      return await joined();
+      return { already: false, league: lg, balance: newBalance, charged: ENTRY };
     }
   }
 
@@ -1268,7 +1160,7 @@ async function joinLeagueServer(user, league, gameweek, opts) {
     throw e;
   }
 
-  return await joined();
+  return { already: false, league: lg, balance: newBalance, charged: ENTRY };
 }
 
 async function markUserSquadPaid(sb, tid, userName, lg, gw, existing) {
@@ -1578,9 +1470,8 @@ async function rejectRequest(requestId) {
 }
 
 // ---- Admin-group money summary: approved / declined deposits & withdrawals ----
-async function getWalletStats(opts) {
+async function getWalletStats() {
   const sb = db();
-  const sinceMs = (opts && Number(opts.since) > 0) ? Number(opts.since) : 0;
   let rows = [];
   for (let from = 0; from < 50000; from += 1000) {
     const { data, error } = await sb.from('wallet_requests').select('*').range(from, from + 999);
@@ -1591,7 +1482,6 @@ async function getWalletStats(opts) {
   const blank = function () { return { approved: { n: 0, sum: 0 }, rejected: { n: 0, sum: 0 }, pending: { n: 0, sum: 0 } }; };
   const all = { deposit: blank(), withdrawal: blank() };
   const today = { deposit: blank(), withdrawal: blank() };
-  const period = { deposit: blank(), withdrawal: blank() };
   // "today" = calendar day in Addis Ababa (UTC+3)
   const dayKey = function (d) { return new Date(new Date(d).getTime() + 3 * 3600 * 1000).toISOString().slice(0, 10); };
   const todayKey = dayKey(Date.now());
@@ -1605,9 +1495,8 @@ async function getWalletStats(opts) {
     all[t][bucket].n++; all[t][bucket].sum += amt;
     const when = r.processed_at || r.created_at;
     if (when && dayKey(when) === todayKey) { today[t][bucket].n++; today[t][bucket].sum += amt; }
-    if (sinceMs && when && new Date(when).getTime() >= sinceMs) { period[t][bucket].n++; period[t][bucket].sum += amt; }
   });
-  return { all: all, today: today, period: period };
+  return { all: all, today: today };
 }
 
 function formatWalletStats(st) {
@@ -1626,49 +1515,6 @@ function formatWalletStats(st) {
   const net = st.all.deposit.approved.sum - st.all.withdrawal.approved.sum;
   return '📊 WALLET SUMMARY\n\n' + block('📅 TODAY', st.today) + '\n\n' + block('🧾 ALL TIME', st.all) +
     '\n\n📈 Net (approved deposits − paid withdrawals): ' + (Math.round(net * 100) / 100) + ' ETB';
-}
-
-// Money report sent to the admin group once, right after a gameweek is paid out.
-async function sendGwMoneyReport(info) {
-  try {
-    const sb = db();
-    const key = 'gw_report_sent_' + info.gameweek;
-    let already = null;
-    try { already = await getSetting(sb, key); } catch (e) {}
-    if (already) return;
-    // Period = since the previous report (so reports tile with no gaps/overlap); first ever = since the previous GW deadline
-    let since = 0;
-    try { since = Date.parse(await getSetting(sb, 'last_gw_report_at')) || 0; } catch (e) {}
-    if (!since && info.prevDeadline) since = Date.parse(info.prevDeadline) || 0;
-    if (!since) since = Date.now() - 7 * 24 * 3600 * 1000;
-    const st = await getWalletStats({ since: since });
-    const f = function (x) { return x.n + ' req = ' + (Math.round(x.sum * 100) / 100) + ' ETB'; };
-    const r2 = function (v) { return Math.round(v * 100) / 100; };
-    const house = r2(info.totalCollected - info.playerPool);
-    const fmtDate = function (ms) { return new Date(ms + 3 * 3600 * 1000).toISOString().slice(0, 16).replace('T', ' '); };
-    const text =
-      '🏁 GW' + info.gameweek + ' FINISHED — MONEY REPORT\n\n' +
-      '👥 Managers who joined: ' + info.managers + '\n' +
-      '💵 Entries (' + info.managers + ' × 100 ETB): ' + r2(info.totalCollected) + ' ETB\n' +
-      '🏆 Prize pool (75%): ' + r2(info.playerPool) + ' ETB\n' +
-      '🏦 House share (25%): ' + house + ' ETB\n' +
-      '✅ Prizes paid now: ' + info.paidOut + ' winner(s) = ' + r2(info.paidSum) + ' ETB' +
-      (info.alreadyPaid ? '\n↩️ Already paid before: ' + info.alreadyPaid + ' winner(s)' : '') + '\n\n' +
-      '📅 Wallet activity since ' + fmtDate(since) + ' (EAT)\n' +
-      '💰 DEPOSITS\n' +
-      '  ✅ Approved: ' + f(st.period.deposit.approved) + '\n' +
-      '  ❌ Declined: ' + f(st.period.deposit.rejected) + '\n' +
-      '💸 WITHDRAWALS\n' +
-      '  ✅ Paid: ' + f(st.period.withdrawal.approved) + '\n' +
-      '  ❌ Declined: ' + f(st.period.withdrawal.rejected) + '\n\n' +
-      '📈 Net (approved deposits − paid withdrawals): ' + r2(st.period.deposit.approved.sum - st.period.withdrawal.approved.sum) + ' ETB\n' +
-      'ℹ️ Entries are counted at 100 ETB each; promo/free entries are not deducted.';
-    const sent = await tg('sendMessage', { chat_id: ADMIN_CHAT_ID, text: text });
-    if (sent && sent.ok) {
-      try { await setSetting(sb, key, new Date().toISOString()); } catch (e) {}
-      try { await setSetting(sb, 'last_gw_report_at', new Date().toISOString()); } catch (e) {}
-    }
-  } catch (e) { console.warn('gw money report failed', e && e.message); }
 }
 
 async function sendWalletStatsToAdmin() {
@@ -1835,6 +1681,106 @@ function adminAuthorized(update, req) {
   try { return crypto.timingSafeEqual(Buffer.from(key), Buffer.from(given)); } catch (e) { return false; }
 }
 
+
+// ---------------------------------------------------------------------------
+// Live points for the leaderboard (server-side, same rule as auto_settle).
+// Previously total_points was only written by each player's own phone when they
+// opened the app, so everybody else showed 0 and the one person who had opened
+// the app looked like #1. Now every manager's points are computed here from the
+// official FPL live data (cached for 60s so it is cheap).
+// ---------------------------------------------------------------------------
+const __LIVE_CACHE = { boot: null, bootAt: 0, live: {}, plMap: null, plAt: 0 };
+
+async function __fplGetCached(path, ttlMs, slot, key) {
+  const now = Date.now();
+  const holder = key ? __LIVE_CACHE[slot] : __LIVE_CACHE;
+  const entry = key ? holder[key] : holder[slot];
+  const atKey = key ? null : slot + 'At';
+  if (key) {
+    if (entry && now - entry.at < ttlMs) return entry.data;
+  } else if (entry && now - __LIVE_CACHE[atKey] < ttlMs) {
+    return entry;
+  }
+  const r = await fetch('https://fantasy.premierleague.com/api' + path, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LeFantasy/1.0)', 'Accept': 'application/json' }
+  });
+  if (!r.ok) throw new Error('FPL ' + path + ' responded ' + r.status);
+  const data = await r.json();
+  if (key) holder[key] = { at: now, data: data };
+  else { __LIVE_CACHE[slot] = data; __LIVE_CACHE[atKey] = now; }
+  return data;
+}
+
+async function applyServerLivePoints(sb, gw, rows) {
+  if (!gw || !rows || !rows.length) return rows;
+  try {
+    const boot = await __fplGetCached('/bootstrap-static/', 10 * 60 * 1000, 'boot');
+    const live = await __fplGetCached('/event/' + gw + '/live/', 60 * 1000, 'live', String(gw));
+    const livePts = {};
+    (live.elements || []).forEach(function (row) {
+      livePts[Number(row.id)] = Number((row.stats && row.stats.total_points) != null ? row.stats.total_points : 0);
+    });
+    const elementIds = {};
+    (boot.elements || []).forEach(function (el) { elementIds[Number(el.id)] = true; });
+
+    if (!__LIVE_CACHE.plMap || Date.now() - __LIVE_CACHE.plAt > 10 * 60 * 1000) {
+      const plRes = await sb.from('players').select('id, fpl_id').limit(5000);
+      const map = {};
+      ((plRes && plRes.data) || []).forEach(function (p) { if (p.fpl_id != null) map[String(p.id)] = Number(p.fpl_id); });
+      __LIVE_CACHE.plMap = map;
+      __LIVE_CACHE.plAt = Date.now();
+    }
+    const fplIdOf = __LIVE_CACHE.plMap;
+
+    const FORMS = {
+      '4-3-3': { def: 4, mid: 3, fwd: 3 }, '3-4-3': { def: 3, mid: 4, fwd: 3 }, '3-5-2': { def: 3, mid: 5, fwd: 2 },
+      '4-4-2': { def: 4, mid: 4, fwd: 2 }, '4-5-1': { def: 4, mid: 5, fwd: 1 }, '5-3-2': { def: 5, mid: 3, fwd: 2 }
+    };
+    const posOf = function (p) { const x = String((p && (p.pos || p.position)) || '').toUpperCase(); return x === 'GK' ? 'GKP' : x; };
+    const chipOf = function (v) {
+      const c = String(v || '').toLowerCase();
+      if (c === 'tc' || c === '3xc' || c === 'triple_captain' || c === 'triple captain') return 'TC';
+      if (c === 'bb' || c === 'bboost' || c === 'bench_boost' || c === 'bench boost') return 'BB';
+      return null;
+    };
+
+    rows.forEach(function (m) {
+      try {
+        let players = m.players;
+        if (typeof players === 'string') { try { players = JSON.parse(players); } catch (e) { players = []; } }
+        players = Array.isArray(players) ? players.filter(Boolean) : [];
+        if (players.length < 11) return; // keep stored value if no full squad
+        let unmatched = 0;
+        const ptsOf = function (p) {
+          const raw = p.fpl_id != null ? p.fpl_id : (fplIdOf[String(p.id)] != null ? fplIdOf[String(p.id)] : p.id);
+          const eid = Number(raw);
+          if (!Number.isFinite(eid) || !elementIds[eid]) { unmatched++; return 0; }
+          return livePts[eid] != null ? livePts[eid] : 0;
+        };
+        const form = FORMS[m.formation] || FORMS['4-3-3'];
+        const byPos = function (k) { return players.filter(function (p) { return posOf(p) === k; }); };
+        let xi = [].concat(byPos('GKP').slice(0, 1), byPos('DEF').slice(0, form.def), byPos('MID').slice(0, form.mid), byPos('FWD').slice(0, form.fwd));
+        let bench;
+        if (xi.length === 11) bench = players.filter(function (p) { return xi.indexOf(p) < 0; });
+        else { xi = players.slice(0, 11); bench = players.slice(11); }
+        const chip = chipOf(m.active_chip);
+        const mult = chip === 'TC' ? 3 : 2;
+        let total = 0;
+        xi.forEach(function (p) {
+          let pts = ptsOf(p);
+          if (m.captain_id != null && String(p.id) === String(m.captain_id)) pts = pts * mult;
+          total += pts;
+        });
+        if (chip === 'BB') bench.forEach(function (p) { total += ptsOf(p); });
+        if (unmatched === 0) m.total_points = total; // only trust fully matched squads
+      } catch (e) { /* keep stored value for this manager */ }
+    });
+  } catch (e) {
+    console.warn('applyServerLivePoints:', e && e.message ? e.message : e);
+  }
+  return rows;
+}
+
 module.exports = async function handler(req, res) {
   try { await loadAdminChatId(); } catch (e) {}
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -1854,7 +1800,7 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({
         ok: true,
         service: 'le-fantasy-telegram',
-        version: 'v8-gw-report',
+        version: 'v7-ads-fix',
         admin_chat: ADMIN_CHAT_ID,
         bot: BOT_TOKEN ? 'token_set' : 'token_missing',
         supabase: (SUPABASE_URL && SUPABASE_SERVICE_KEY) ? 'env_set' : 'env_missing',
@@ -2253,8 +2199,16 @@ module.exports = async function handler(req, res) {
         });
         if (!filtered.length && !gw) filtered = rows;
 
+        // Compute everybody's points on the server so the board is correct for all managers
+        await applyServerLivePoints(sb, gw, filtered);
+
         filtered.sort(function (a, b) {
-          return Number(b.total_points || 0) - Number(a.total_points || 0);
+          var d = Number(b.total_points || 0) - Number(a.total_points || 0);
+          if (d) return d;
+          var ta = new Date(a.created_at || a.joined_at || 0).getTime() || 0;
+          var tb = new Date(b.created_at || b.joined_at || 0).getTime() || 0;
+          if (ta !== tb) return ta - tb;
+          return String(a.user_name || '').localeCompare(String(b.user_name || ''));
         });
 
         return res.status(200).json({
@@ -2443,4 +2397,72 @@ module.exports = async function handler(req, res) {
             return livePts[eid] != null ? livePts[eid] : 0;
           };
           const form = FORMS[m.formation] || FORMS['4-3-3'];
-          const byPos = function (k) { return players.filter(function (p) { return posOf(p) 
+          const byPos = function (k) { return players.filter(function (p) { return posOf(p) === k; }); };
+          let xi = [].concat(byPos('GKP').slice(0, 1), byPos('DEF').slice(0, form.def), byPos('MID').slice(0, form.mid), byPos('FWD').slice(0, form.fwd));
+          let bench;
+          if (xi.length === 11) bench = players.filter(function (p) { return xi.indexOf(p) < 0; });
+          else { xi = players.slice(0, 11); bench = players.slice(11); }
+          const chip = chipOf(m.active_chip);
+          const mult = chip === 'TC' ? 3 : 2;
+          let total = 0;
+          xi.forEach(function (p) {
+            let pts = ptsOf(p);
+            if (m.captain_id != null && String(p.id) === String(m.captain_id)) pts = pts * mult;
+            total += pts;
+          });
+          if (chip === 'BB') bench.forEach(function (p) { total += ptsOf(p); });
+          m._final = total;
+          m._chip = chip;
+          m._unmatched = unmatched;
+          m._empty = players.length === 0;
+        });
+
+        // Same rule as the leaderboard: no saved squad = not ranked, no prize
+        rows = rows.filter(function (m) { return !m._empty; });
+
+        // Ranking: points, then earlier entry, then name (same tie-break as the leaderboard)
+        rows.sort(function (a, b) {
+          if (b._final !== a._final) return b._final - a._final;
+          const ta = Date.parse(a.joined_at || a.created_at || 0) || 0;
+          const tb = Date.parse(b.joined_at || b.created_at || 0) || 0;
+          if (ta && tb && ta !== tb) return ta - tb;
+          const na = String(a.user_name || '').toLowerCase(), nb = String(b.user_name || '').toLowerCase();
+          return na < nb ? -1 : (na > nb ? 1 : 0);
+        });
+
+        const n = rows.length;
+        const totalCollected = n * entry;
+        const playerPool = Math.round(totalCollected * 0.75);
+        // Prize table: EXACTLY the same as the leaderboard shows in the app
+        // (top 10 share by fixed percentages, last 2 places get 3.5% of the pool, min 100 ETB)
+        const prizes = new Array(n).fill(0);
+        if (n > 0) {
+          let lastCount = n >= 12 ? 2 : (n === 11 ? 1 : 0);
+          let lastEach = 0;
+          let lastTotal = 0;
+          if (lastCount > 0) {
+            lastEach = Math.max(100, Math.round(playerPool * 0.035));
+            lastTotal = lastEach * lastCount;
+            if (lastTotal > playerPool * 0.12) {
+              lastEach = Math.max(100, Math.floor((playerPool * 0.12) / lastCount));
+              lastTotal = lastEach * lastCount;
+            }
+          }
+          const topPool = Math.max(0, playerPool - lastTotal);
+          const fairTop = [0.34, 0.20, 0.11, 0.08, 0.06, 0.05, 0.045, 0.04, 0.035, 0.035];
+          const topN = Math.min(10, Math.max(0, n - lastCount));
+          let assigned = 0;
+          for (let i = 0; i < topN; i++) {
+            const amt = Math.round(topPool * fairTop[i]);
+            prizes[i] = amt;
+            assigned += amt;
+          }
+          for (let k = 0; k < lastCount; k++) {
+            const idx = n - 1 - k;
+            if (idx >= topN) prizes[idx] = lastEach;
+          }
+          const leftover = topPool - assigned;
+          if (leftover !== 0 && topN > 0) prizes[0] += leftover;
+        }
+
+        // Already settled? (if this lookup fails we STOP rather than risk paying tw
