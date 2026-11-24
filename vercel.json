@@ -1,0 +1,5 @@
+{
+  "crons": [
+    { "path": "/api/telegram?action=auto_settle", "schedule": "0 6 * * *" }
+  ]
+}
